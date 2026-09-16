@@ -1,0 +1,42 @@
+#
+# dvmsip-config.yml — DVM SIP Telephone Interconnect configuration
+#
+# Copy this file to dvmsip-config.yml and edit for your site.
+#
+
+log:
+  displayLevel: 1          # 0=none 1=info 2=debug 3=trace (console)
+  fileLevel: 1             # 0=none 1=info 2=debug 3=trace (file)
+  filePath: ./dvmsip.log   # Log file path; rolls daily, keeps 7 days
+
+system:
+  identity: "DVMSIP-1"    # FNE peer identity string (shown in FNE peer list)
+
+network:                   # FNE master connection
+  address: "192.168.1.10"  # FNE master address (IP or hostname)
+  port: 62031              # FNE master port
+  local: 0                 # Local UDP port hint (0 = OS-assigned; kept for DVM config parity)
+  peerId: 9000001          # Peer ID — must be unique; must not clash with any dvmhost peer
+  password: "s3cr3t"       # FNE passphrase
+  jitter: 360              # Voice playout jitter buffer in ms (must be multiple of 20)
+
+sip:
+  registrar: "sip:pbx.local"   # SIP registrar URI
+  user: "phonepatch"           # SIP username / extension
+  password: "sip-password"     # SIP auth password
+  realm: "pbx.local"           # SIP auth realm
+  proxy: ""                    # Outbound proxy URI; leave empty to disable
+  localPort: 5060              # Local SIP UDP port
+  localAddress: "0.0.0.0"      # Local address to bind SIP transport (0.0.0.0 = all interfaces)
+
+rtp:
+  portRangeStart: 16384    # First RTP port (must be even)
+  portRangeEnd: 16512      # Last RTP port in range
+  dtmfRelay: true          # Relay RFC 4733 telephone-event DTMF (logging only in Phase 1/2)
+
+phonePatch:
+  mode: "conventional"     # "conventional" only in Phase 1/2 (trunked requires dvmhost PR)
+  talkgroup: 1             # Talkgroup to bridge in conventional mode
+  sourceRID: 9000001       # Source RID injected for SIP-originated transmissions
+  maxCalls: 1              # Maximum simultaneous phone patch calls
+  inboundDID: "1000"       # SIP extension dialled for incoming PSTN/SIP calls

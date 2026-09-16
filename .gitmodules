@@ -1,0 +1,6 @@
+[submodule "extern/fnecore"]
+	path = extern/fnecore
+	url = https://github.com/DVMProject/fnecore
+[submodule "extern/dvmvocoder"]
+	path = extern/dvmvocoder
+	url = https://github.com/DVMProject/dvmvocoder

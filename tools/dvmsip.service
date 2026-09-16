@@ -1,0 +1,16 @@
+[Unit]
+Description=DVM SIP Phone Patch
+Documentation=https://github.com/DVMProject/dvmsip
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dvmsip -c /etc/dvmsip/dvmsip-config.yml
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dvmsip
+
+[Install]
+WantedBy=multi-user.target

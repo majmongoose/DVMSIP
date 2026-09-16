@@ -1,0 +1,38 @@
+# .NET build output
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# NuGet
+*.nupkg
+packages/
+project.lock.json
+project.fragment.lock.json
+
+# Publish output
+publish/
+out/
+
+# Runtime config overrides
+appsettings.*.json
+dvmsip-config.yml
+!configs/dvmsip-config.example.yml
+
+# Native vocoder library (built per-platform, not checked in)
+libvocoder.so
+libvocoder.dylib
+libvocoder.dll
+
+# Log files
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Rider / VS Code
+.idea/
+.vscode/
+*.DotSettings.user
