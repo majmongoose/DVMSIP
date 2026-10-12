@@ -10,7 +10,9 @@
 using System.Net;
 using dvmsip.Vocoder;
 using Serilog;
+using SIPSorcery.Media;
 using SIPSorcery.Net;
+using SIPSorceryMedia.Abstractions;
 
 namespace dvmsip.Sip
 {
@@ -19,25 +21,20 @@ namespace dvmsip.Sip
     ///
     /// SIP → FNE: RTP PCMU packets decoded to PCM and written to AudioBridge.PcmInbound
     /// FNE → SIP: PCM frames from AudioBridge.PcmToSip encoded to PCMU and sent via RTP
-    ///
-    /// G.711 µ-law encode/decode implemented inline — no external library needed.
-    /// Codec table is public domain (~256 bytes each way).
     /// </summary>
     internal sealed class RtpBridge : IDisposable
     {
-        public const int PcmSamples   = 160;   // 20 ms at 8 kHz
-        public const int PcmuBytes    = 160;   // 1 byte per sample for PCMU
+        public const int PcmSamples = 160;   // 20 ms at 8 kHz, 1 byte per sample for PCMU
 
         private readonly AudioBridge _bridge;
         private readonly int _rtpPort;
+        private readonly object _lock = new();
         private RTPSession? _rtpSession;
         private Thread? _sendThread;
-        private readonly CancellationTokenSource _cts = new();
+        private CancellationTokenSource? _callCts;
         private bool _disposed;
-        private uint _rtpTimestamp;
 
         public int RtpPort => _rtpPort;
-        public bool IsActive => _rtpSession != null;
 
         public RtpBridge(AudioBridge bridge, int rtpPort)
         {
@@ -45,109 +42,107 @@ namespace dvmsip.Sip
             _rtpPort = rtpPort;
         }
 
-        /// <summary>Attach an active RTP session (called when a SIP call connects).</summary>
+        /// <summary>Attach an RTP session for a new call. Any previous session is detached first.</summary>
         public void Attach(RTPSession session)
         {
-            _rtpSession = session;
-            _rtpSession.OnRtpPacketReceived += OnRtpReceived;
-
-            _sendThread = new Thread(SendLoop)
+            lock (_lock)
             {
-                Name = $"dvmsip-rtp-{_rtpPort}",
-                IsBackground = true,
-                Priority = ThreadPriority.AboveNormal,
-            };
-            _sendThread.Start();
+                DetachLocked();
+
+                _rtpSession = session;
+                _rtpSession.OnRtpPacketReceived += OnRtpReceived;
+                _callCts = new CancellationTokenSource();
+                _bridge.BeginCall();
+
+                var ct = _callCts.Token;
+                _sendThread = new Thread(() => SendLoop(session, ct))
+                {
+                    Name = $"dvmsip-rtp-{_rtpPort}",
+                    IsBackground = true,
+                    Priority = ThreadPriority.AboveNormal,
+                };
+                _sendThread.Start();
+            }
 
             Log.Debug("[RTP] Session attached on port {Port}", _rtpPort);
         }
 
-        /// <summary>Detach the RTP session (called when a SIP call ends).</summary>
+        /// <summary>Detach and close the current RTP session (idempotent).</summary>
         public void Detach()
         {
-            if (_rtpSession == null) return;
-            _rtpSession.OnRtpPacketReceived -= OnRtpReceived;
-            _rtpSession = null;
-            _cts.Cancel();
+            lock (_lock)
+            {
+                if (_rtpSession == null) return;
+                DetachLocked();
+            }
             Log.Debug("[RTP] Session detached on port {Port}", _rtpPort);
+        }
+
+        private void DetachLocked()
+        {
+            if (_rtpSession == null) return;
+
+            _callCts?.Cancel();
+            _rtpSession.OnRtpPacketReceived -= OnRtpReceived;
+            _rtpSession.Close("call ended");
+
+            if (_sendThread != null && _sendThread != Thread.CurrentThread)
+                _sendThread.Join(TimeSpan.FromSeconds(1));
+
+            _bridge.EndCall();
+
+            _callCts?.Dispose();
+            _callCts    = null;
+            _sendThread = null;
+            _rtpSession = null;
         }
 
         // ---- RTP receive (SIP → FNE) ----
 
-        private void OnRtpReceived(IPEndPoint remoteEndPoint, SDPMediaTypesEnum mediaType,
-            RTPPacket rtpPacket)
+        private void OnRtpReceived(IPEndPoint remoteEndPoint, SDPMediaTypesEnum mediaType, RTPPacket rtpPacket)
         {
             if (mediaType != SDPMediaTypesEnum.audio) return;
+            if (rtpPacket.Header.PayloadType != (int)SDPWellKnownMediaFormatsEnum.PCMU) return;
+
             var payload = rtpPacket.Payload;
-            if (payload == null || payload.Length < PcmuBytes) return;
+            if (payload == null) return;
 
-            var pcm = new short[PcmSamples];
-            for (int i = 0; i < PcmSamples; i++)
-                pcm[i] = MuLawDecode(payload[i]);
+            // Re-frame to 20 ms blocks so senders using other ptime values are not truncated
+            for (int offset = 0; offset + PcmSamples <= payload.Length; offset += PcmSamples)
+            {
+                var pcm = new short[PcmSamples];
+                for (int i = 0; i < PcmSamples; i++)
+                    pcm[i] = MuLawDecoder.MuLawToLinearSample(payload[offset + i]);
 
-            _bridge.PcmInbound.Writer.TryWrite(pcm);
+                _bridge.PcmInbound.Writer.TryWrite(pcm);
+            }
         }
 
         // ---- RTP send loop (FNE → SIP) ----
 
-        private void SendLoop()
+        private void SendLoop(RTPSession session, CancellationToken ct)
         {
-            var ct = _cts.Token;
+            var reader = _bridge.PcmToSip.Reader;
             try
             {
-                while (!ct.IsCancellationRequested)
+                while (reader.WaitToReadAsync(ct).AsTask().GetAwaiter().GetResult())
                 {
-                    if (_bridge.PcmToSip.Reader.TryRead(out var pcm) && _rtpSession != null)
+                    while (reader.TryRead(out var pcm))
                     {
-                        var pcmu = new byte[PcmuBytes];
+                        var pcmu = new byte[PcmSamples];
                         for (int i = 0; i < PcmSamples; i++)
-                            pcmu[i] = MuLawEncode(pcm[i]);
+                            pcmu[i] = MuLawEncoder.LinearToMuLawSample(pcm[i]);
 
-                        _rtpSession.SendAudio(_rtpTimestamp, pcmu);
-                        _rtpTimestamp += PcmSamples;
-                    }
-                    else
-                    {
-                        Thread.Sleep(1);
+                        // First argument is the duration in RTP units added to the previous timestamp
+                        session.SendAudio(PcmSamples, pcmu);
                     }
                 }
             }
-            catch (OperationCanceledException) { /* normal */ }
+            catch (OperationCanceledException) { /* call ended */ }
             catch (Exception ex)
             {
                 Log.Error(ex, "[RTP] Send loop error on port {Port}", _rtpPort);
             }
-        }
-
-        // ---- G.711 µ-law codec (public domain) ----
-
-        private static short MuLawDecode(byte mulaw)
-        {
-            mulaw = (byte)~mulaw;
-            int sign  = (mulaw & 0x80) != 0 ? -1 : 1;
-            int exp   = (mulaw >> 4) & 0x07;
-            int mant  = mulaw & 0x0F;
-            int mag   = ((mant << 1) | 0x21) << exp;
-            return (short)(sign * (mag - 33));
-        }
-
-        private static byte MuLawEncode(short pcm)
-        {
-            const int MuLawMax = 0x1FFF;
-            const int MuLawBias = 0x21;
-
-            int sign = (pcm < 0) ? 0x80 : 0;
-            int s = Math.Abs(pcm);
-            s = Math.Min(s, MuLawMax);
-            s += MuLawBias;
-
-            int exp = 7;
-            for (; exp > 0; exp--)
-            {
-                if ((s & (1 << (exp + 3))) != 0) break;
-            }
-            int mant = (s >> (exp + 3)) & 0x0F;
-            return (byte)(~(sign | (exp << 4) | mant) & 0xFF);
         }
 
         public void Dispose()
@@ -155,7 +150,6 @@ namespace dvmsip.Sip
             if (_disposed) return;
             _disposed = true;
             Detach();
-            _cts.Dispose();
         }
     }
 }

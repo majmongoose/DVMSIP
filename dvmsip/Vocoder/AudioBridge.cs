@@ -15,14 +15,12 @@ namespace dvmsip.Vocoder
     /// <summary>
     /// Owns the IMBE vocoder and bridges audio between the FNE (P25 IMBE) and SIP (PCM) paths.
     ///
-    /// FNE → SIP:  IMBE frames arrive on ImbeInbound → decode → PCM written to PcmToSip
+    /// FNE → SIP:  IMBE frames arrive on ImbeInbound → decode → playout queue → PcmToSip every 20 ms
     /// SIP → FNE:  PCM frames arrive on PcmInbound   → encode → IMBE written to ImbeToFne
     ///
-    /// Runs a single dedicated background thread at AboveNormal priority to guarantee
-    /// consistent 20 ms frame timing without OS task-scheduler jitter.
-    ///
-    /// Phase 2: a playout jitter buffer holds up to jitterMs worth of decoded PCM before
-    /// releasing one frame every 20 ms via PeriodicTimer, smoothing FNE's 180 ms LDU bursts.
+    /// Decode and encode each run on a dedicated AboveNormal thread that blocks on its input
+    /// channel; they use separate native decoder/encoder contexts. A playout thread releases one
+    /// PCM frame every 20 ms while a call is active, smoothing FNE's 180 ms LDU bursts.
     /// </summary>
     internal sealed class AudioBridge : IDisposable
     {
@@ -33,10 +31,12 @@ namespace dvmsip.Vocoder
             Channel.CreateBounded<byte[]>(new BoundedChannelOptions(64)
                 { SingleReader = true, SingleWriter = false, FullMode = BoundedChannelFullMode.DropOldest });
 
+        // PcmToSip and ImbeToFne are also drained by ClearBuffers on call boundaries, so not SingleReader.
+
         /// <summary>bridge → SIP: read short[160] PCM frames here (from RtpBridge).</summary>
         public Channel<short[]> PcmToSip { get; } =
             Channel.CreateBounded<short[]>(new BoundedChannelOptions(64)
-                { SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.DropOldest });
+                { SingleReader = false, SingleWriter = true, FullMode = BoundedChannelFullMode.DropOldest });
 
         /// <summary>SIP → bridge: write short[160] PCM frames here (from RtpBridge).</summary>
         public Channel<short[]> PcmInbound { get; } =
@@ -46,127 +46,140 @@ namespace dvmsip.Vocoder
         /// <summary>bridge → FNE: read byte[11] IMBE frames here (from SipPeerSystem).</summary>
         public Channel<byte[]> ImbeToFne { get; } =
             Channel.CreateBounded<byte[]>(new BoundedChannelOptions(64)
-                { SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.DropOldest });
+                { SingleReader = false, SingleWriter = true, FullMode = BoundedChannelFullMode.DropOldest });
 
-        // ---- Jitter playout buffer (Phase 2) ----
+        // ---- Jitter playout buffer ----
 
-        private readonly int _jitterMs;
         private readonly Queue<short[]> _playoutQueue = new();
         private readonly int _maxPlayoutFrames;
-        private PeriodicTimer? _playoutTimer;
-        private Thread? _playoutThread;
+        private volatile bool _callActive;
 
-        // ---- Codec thread ----
+        // ---- Threads ----
 
-        private readonly Thread _codecThread;
+        private readonly Thread _decodeThread;
+        private readonly Thread _encodeThread;
+        private readonly Thread _playoutThread;
         private readonly CancellationTokenSource _cts = new();
         private ImbeVocoder? _vocoder;
+        private bool _started;
         private bool _disposed;
 
         public AudioBridge(int jitterMs = 360)
         {
-            _jitterMs = jitterMs;
             // Each IMBE frame = 20 ms; cap buffer at jitterMs / 20, minimum 3 frames
             _maxPlayoutFrames = Math.Max(3, jitterMs / 20);
 
-            _codecThread = new Thread(CodecLoop)
-            {
-                Name = "dvmsip-codec",
-                IsBackground = false,
-                Priority = ThreadPriority.AboveNormal,
-            };
+            _decodeThread  = NewThread("dvmsip-decode", DecodeLoop);
+            _encodeThread  = NewThread("dvmsip-encode", EncodeLoop);
+            _playoutThread = NewThread("dvmsip-playout", PlayoutLoop);
         }
+
+        private static Thread NewThread(string name, ThreadStart loop) => new(loop)
+        {
+            Name = name,
+            IsBackground = true,
+            Priority = ThreadPriority.AboveNormal,
+        };
 
         public void Start()
         {
             _vocoder = new ImbeVocoder();
-            _codecThread.Start();
-            StartPlayoutTimer();
+            _decodeThread.Start();
+            _encodeThread.Start();
+            _playoutThread.Start();
+            _started = true;
         }
 
-        public void Stop()
+        /// <summary>Clears stale audio and starts emitting playout frames for a new call.</summary>
+        public void BeginCall()
         {
-            _cts.Cancel();
+            ClearBuffers();
+            _callActive = true;
         }
 
-        // ---- Codec loop: runs on dedicated thread ----
-
-        private void CodecLoop()
+        /// <summary>Stops playout and discards buffered audio for the ended call.</summary>
+        public void EndCall()
         {
-            Log.Debug("[AudioBridge] Codec thread started");
+            _callActive = false;
+            ClearBuffers();
+        }
+
+        private void ClearBuffers()
+        {
+            lock (_playoutQueue) _playoutQueue.Clear();
+            while (PcmToSip.Reader.TryRead(out _)) { }
+            while (ImbeToFne.Reader.TryRead(out _)) { }
+        }
+
+        // ---- Codec loops: each blocks on its input channel ----
+
+        private void DecodeLoop()
+        {
+            var reader = ImbeInbound.Reader;
+            RunLoop("decode", () =>
+            {
+                while (reader.TryRead(out var imbeFrame))
+                {
+                    var pcm = new short[ImbeVocoder.PcmSamples];
+                    _vocoder!.Decode(imbeFrame, pcm);
+
+                    lock (_playoutQueue)
+                    {
+                        if (_playoutQueue.Count >= _maxPlayoutFrames)
+                            _playoutQueue.Dequeue(); // drop oldest on overflow
+                        _playoutQueue.Enqueue(pcm);
+                    }
+                }
+            }, reader.WaitToReadAsync);
+        }
+
+        private void EncodeLoop()
+        {
+            var reader = PcmInbound.Reader;
+            RunLoop("encode", () =>
+            {
+                while (reader.TryRead(out var pcm))
+                {
+                    var imbeFrame = new byte[ImbeVocoder.ImbeFrameBytes];
+                    _vocoder!.Encode(pcm, imbeFrame);
+                    ImbeToFne.Writer.TryWrite(imbeFrame);
+                }
+            }, reader.WaitToReadAsync);
+        }
+
+        private void RunLoop(string name, Action drain, Func<CancellationToken, ValueTask<bool>> waitToRead)
+        {
             var ct = _cts.Token;
-
             try
             {
-                while (!ct.IsCancellationRequested)
-                {
-                    // Drain IMBE inbound (FNE → SIP)
-                    while (ImbeInbound.Reader.TryRead(out var imbeFrame))
-                    {
-                        var pcm = new short[ImbeVocoder.PcmSamples];
-                        _vocoder!.Decode(imbeFrame, pcm);
-
-                        lock (_playoutQueue)
-                        {
-                            if (_playoutQueue.Count >= _maxPlayoutFrames)
-                                _playoutQueue.Dequeue(); // drop oldest on overflow
-                            _playoutQueue.Enqueue(pcm);
-                        }
-                    }
-
-                    // Drain PCM inbound (SIP → FNE)
-                    while (PcmInbound.Reader.TryRead(out var pcm))
-                    {
-                        var imbeFrame = new byte[ImbeVocoder.ImbeFrameBytes];
-                        _vocoder!.Encode(pcm, imbeFrame);
-                        ImbeToFne.Writer.TryWrite(imbeFrame);
-                    }
-
-                    Thread.Sleep(1); // yield; playout timer drives actual 20 ms cadence
-                }
+                while (waitToRead(ct).AsTask().GetAwaiter().GetResult())
+                    drain();
             }
             catch (OperationCanceledException) { /* normal shutdown */ }
             catch (Exception ex)
             {
-                Log.Error(ex, "[AudioBridge] Codec thread error");
+                Log.Error(ex, "[AudioBridge] {Name} thread error", name);
             }
-
-            Log.Debug("[AudioBridge] Codec thread stopped");
         }
 
-        // ---- Playout timer: releases one PCM frame every 20 ms toward SIP ----
-
-        private void StartPlayoutTimer()
-        {
-            _playoutTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(20));
-            _playoutThread = new Thread(PlayoutLoop)
-            {
-                Name = "dvmsip-playout",
-                IsBackground = true,
-                Priority = ThreadPriority.AboveNormal,
-            };
-            _playoutThread.Start();
-        }
+        // ---- Playout: releases one PCM frame every 20 ms toward SIP while a call is active ----
 
         private void PlayoutLoop()
         {
+            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(20));
             var ct = _cts.Token;
             try
             {
-                while (_playoutTimer!.WaitForNextTickAsync(ct).AsTask().GetAwaiter().GetResult())
+                while (timer.WaitForNextTickAsync(ct).AsTask().GetAwaiter().GetResult())
                 {
-                    short[]? frame = null;
-                    lock (_playoutQueue)
-                    {
-                        if (_playoutQueue.Count > 0)
-                            frame = _playoutQueue.Dequeue();
-                    }
+                    if (!_callActive) continue;
 
-                    if (frame != null)
-                        PcmToSip.Writer.TryWrite(frame);
-                    else
-                        // Emit silence to keep RTP stream flowing during gaps
-                        PcmToSip.Writer.TryWrite(new short[ImbeVocoder.PcmSamples]);
+                    short[]? frame;
+                    lock (_playoutQueue)
+                        _playoutQueue.TryDequeue(out frame);
+
+                    // Emit silence during gaps to keep the RTP stream flowing
+                    PcmToSip.Writer.TryWrite(frame ?? new short[ImbeVocoder.PcmSamples]);
                 }
             }
             catch (OperationCanceledException) { /* normal shutdown */ }
@@ -177,8 +190,17 @@ namespace dvmsip.Vocoder
             if (_disposed) return;
             _disposed = true;
             _cts.Cancel();
-            _playoutTimer?.Dispose();
+
+            // Native contexts must outlive any in-flight Decode/Encode call
+            if (_started)
+            {
+                _decodeThread.Join();
+                _encodeThread.Join();
+                _playoutThread.Join();
+            }
+
             _vocoder?.Dispose();
+            _cts.Dispose();
         }
     }
 }

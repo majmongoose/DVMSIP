@@ -104,6 +104,9 @@ namespace dvmsip.Configuration
 
         [YamlMember(Alias = "inboundDID")]
         public string InboundDid { get; set; } = "1000";
+
+        [YamlMember(Alias = "outboundNumber")]
+        public string OutboundNumber { get; set; } = "";
     }
 
     public class DvmSipConfig

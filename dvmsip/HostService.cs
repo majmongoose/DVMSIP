@@ -47,12 +47,16 @@ namespace dvmsip
 
             // Allocate call slots — each slot has its own AudioBridge and CallStateMachine
             int rtpPort = _config.Rtp.PortRangeStart;
+            if (rtpPort + slotCount * 2 - 1 > _config.Rtp.PortRangeEnd)
+                throw new InvalidOperationException(
+                    $"rtp port range {_config.Rtp.PortRangeStart}-{_config.Rtp.PortRangeEnd} is too small for {slotCount} call slot(s)");
+
             for (int i = 0; i < slotCount; i++)
             {
                 var bridge = new AudioBridge(_config.Network.Jitter);
                 var rtpBridge = new RtpBridge(bridge, rtpPort);
                 rtpPort += 2; // RTP + RTCP
-                var sm = new CallStateMachine(i, _config, rtpBridge, bridge);
+                var sm = new CallStateMachine(i, _config);
                 _slots.Add(new CallSlot(bridge, rtpBridge, sm));
             }
 

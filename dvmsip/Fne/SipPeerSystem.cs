@@ -8,7 +8,6 @@
  */
 
 using System.Net;
-using System.Threading.Channels;
 using dvmsip.CallControl;
 using dvmsip.Configuration;
 using fnecore;
@@ -25,16 +24,30 @@ namespace dvmsip.Fne
     /// </summary>
     internal sealed class SipPeerSystem : FneSystemBase
     {
-        // IMBE byte offsets within a 216-byte P25 LDU FNE payload.
-        // Verified from dvmconsole/FneSystemBase.P25.cs.
-        private static readonly int[] LduImbeOffsets = { 10, 26, 55, 80, 105, 130, 155, 180, 204 };
+        // FNE P25 LDU messages carry a 24-byte header followed by nine DFSI voice records
+        // (22, 14, 17 x 6, 16 bytes). These are the record offsets relative to the end of the header,
+        // and the IMBE codeword offset within each record (matches dvmhost/dvmconsole DFSI framing).
+        private static readonly int[] DfsiRecordOffsets = { 0, 22, 36, 53, 70, 87, 104, 121, 138 };
+        private static readonly int[] ImbeOffsetInRecord = { 10, 1, 5, 5, 5, 5, 5, 5, 4 };
+        private const int DfsiLength = 154;
 
         private const int ImbeFrameBytes = 11;
+        private const int FramesPerLdu = 9;
 
         private readonly DvmSipConfig _config;
         private readonly IReadOnlyList<CallSlot> _slots;
+        private readonly Dictionary<CallSlot, TxState> _tx = new();
 
         public FnePeer Peer => (FnePeer)fne;
+
+        private sealed class TxState
+        {
+            public readonly byte[][] Frames = new byte[FramesPerLdu][];
+            public int FrameCount;
+            public uint StreamId;
+            public ushort Seq;
+            public bool NextIsLdu2;
+        }
 
         // ---- Constructor ----
 
@@ -43,6 +56,9 @@ namespace dvmsip.Fne
         {
             _config = config;
             _slots  = slots;
+
+            foreach (var slot in slots)
+                _tx[slot] = new TxState();
 
             // PeerDisconnected is an Action<uint> delegate on FnePeer (not an abstract override)
             Peer.PeerDisconnected = OnPeerDisconnected;
@@ -104,17 +120,21 @@ namespace dvmsip.Fne
             if (e.DstId != _config.PhonePatch.Talkgroup) return;
             if (e.DUID != P25DUID.LDU1 && e.DUID != P25DUID.LDU2) return;
 
+            byte firstTag = e.DUID == P25DUID.LDU1 ? P25DFSI.P25_DFSI_LDU1_VOICE1 : P25DFSI.P25_DFSI_LDU2_VOICE10;
+            if (!HasValidDfsiRecords(e.Data, firstTag))
+            {
+                Log.Debug("[FNE] Dropping malformed {Duid} from RID {SrcId}", e.DUID, e.SrcId);
+                return;
+            }
+
             // Find a slot that is active for this talkgroup, or the first idle slot
             var slot = FindSlotForIncoming(e.SrcId, e.DstId);
             if (slot == null) return;
 
-            // Extract 9 IMBE frames from the LDU payload and forward to the audio bridge
-            foreach (int offset in LduImbeOffsets)
+            for (int i = 0; i < FramesPerLdu; i++)
             {
-                if (offset + ImbeFrameBytes > e.Data.Length) break;
-
                 var imbe = new byte[ImbeFrameBytes];
-                Buffer.BlockCopy(e.Data, offset, imbe, 0, ImbeFrameBytes);
+                Buffer.BlockCopy(e.Data, ImbeOffset(i), imbe, 0, ImbeFrameBytes);
                 slot.Bridge.ImbeInbound.Writer.TryWrite(imbe);
             }
 
@@ -134,8 +154,8 @@ namespace dvmsip.Fne
         // ---- SIP → FNE transmit loops (one per slot) ----
 
         /// <summary>
-        /// Starts a background task per slot that drains ImbeToFne and assembles 9-frame LDU1 packets
-        /// to transmit toward the FNE talkgroup (SIP → radio direction).
+        /// Starts a background task per slot that drains ImbeToFne and transmits alternating
+        /// LDU1/LDU2 toward the FNE talkgroup (SIP → radio direction).
         /// </summary>
         public void StartTransmitLoops(CancellationToken ct)
         {
@@ -148,28 +168,133 @@ namespace dvmsip.Fne
 
         private async Task TransmitLoopAsync(CallSlot slot, CancellationToken ct)
         {
-            var frames = new byte[9][];
-            int frameCount = 0;
-
+            var tx = _tx[slot];
             try
             {
                 await foreach (var imbe in slot.Bridge.ImbeToFne.Reader.ReadAllAsync(ct))
                 {
-                    frames[frameCount++] = imbe;
-                    if (frameCount == 9)
+                    // Drop codec tail frames that arrive after the call has been torn down,
+                    // otherwise they would open a new stream that is never terminated.
+                    if (!slot.StateMachine.IsActive) continue;
+
+                    lock (tx)
                     {
-                        TransmitLdu(_config.PhonePatch.SourceRid, _config.PhonePatch.Talkgroup, frames);
-                        frames = new byte[9][];
-                        frameCount = 0;
+                        tx.Frames[tx.FrameCount++] = imbe;
+                        if (tx.FrameCount < FramesPerLdu) continue;
+                        tx.FrameCount = 0;
+                        SendLdu(tx);
                     }
                 }
             }
             catch (OperationCanceledException) { /* normal shutdown */ }
             catch (Exception ex)
             {
-                Log.Error(ex, "[FNE] Transmit loop error for slot");
+                Log.Error(ex, "[FNE] Transmit loop error");
             }
         }
+
+        /// <summary>Terminates the slot's SIP → radio stream with a TDU, if one is open.</summary>
+        public void EndTransmit(CallSlot slot)
+        {
+            var tx = _tx[slot];
+            lock (tx)
+            {
+                tx.FrameCount = 0;
+                if (tx.StreamId == 0) return;
+
+                SendP25TDU(CreateCallData(tx.StreamId));
+                Log.Debug("[FNE] Sent TDU for stream {StreamId}", tx.StreamId);
+                tx.StreamId = 0;
+            }
+        }
+
+        private void SendLdu(TxState tx)
+        {
+            if (tx.StreamId == 0)
+            {
+                tx.StreamId   = (uint)Random.Shared.Next(1, int.MaxValue);
+                tx.Seq        = 0;
+                tx.NextIsLdu2 = false;
+            }
+
+            var callData = CreateCallData(tx.StreamId);
+            bool ldu2    = tx.NextIsLdu2;
+            var  duid    = ldu2 ? P25DUID.LDU2 : P25DUID.LDU1;
+
+            var payload = new byte[ldu2 ? Constants.P25LDU2PacketLength : Constants.P25LDU1PacketLength];
+            CreateP25MessageHdr((byte)duid, callData, ref payload);
+
+            byte firstTag = ldu2 ? P25DFSI.P25_DFSI_LDU2_VOICE10 : P25DFSI.P25_DFSI_LDU1_VOICE1;
+            for (int i = 0; i < FramesPerLdu; i++)
+            {
+                int rec = P25_MSG_HDR_SIZE + DfsiRecordOffsets[i];
+                payload[rec] = (byte)(firstTag + i);
+
+                if (ldu2)
+                    WriteLdu2RecordFields(payload, rec, i, callData);
+                else
+                    WriteLdu1RecordFields(payload, rec, i, callData);
+
+                Buffer.BlockCopy(tx.Frames[i], 0, payload, ImbeOffset(i), ImbeFrameBytes);
+            }
+
+            payload[23] = (byte)(P25_MSG_HDR_SIZE + DfsiLength);
+
+            ushort seq = tx.Seq;
+            tx.Seq = (ushort)((tx.Seq + 1) % Constants.RtpCallEndSeq);
+            tx.NextIsLdu2 = !ldu2;
+
+            Peer.SendMaster(
+                FneBase.CreateOpcode(Constants.NET_FUNC_PROTOCOL, Constants.NET_PROTOCOL_SUBFUNC_P25),
+                payload, seq, callData.TxStreamID);
+        }
+
+        private static void WriteLdu1RecordFields(byte[] data, int rec, int index, RemoteCallData callData)
+        {
+            switch (index)
+            {
+                case 2: // VOICE3 + LC: LCO, MFId, service options
+                    data[rec + 1] = callData.LCO;
+                    data[rec + 2] = callData.MFId;
+                    data[rec + 3] = callData.ServiceOptions;
+                    break;
+                case 3: // VOICE4 + LC: destination address
+                    FneUtils.Write3Bytes(callData.DstId, ref data, rec + 1);
+                    break;
+                case 4: // VOICE5 + LC: source address
+                    FneUtils.Write3Bytes(callData.SrcId, ref data, rec + 1);
+                    break;
+                case 8: // VOICE9 + LSD
+                    data[rec + 1] = callData.LSD1;
+                    data[rec + 2] = callData.LSD2;
+                    break;
+            }
+        }
+
+        private static void WriteLdu2RecordFields(byte[] data, int rec, int index, RemoteCallData callData)
+        {
+            switch (index)
+            {
+                // VOICE12..14 carry the 9-byte MI, which is all zero for clear voice
+                case 5: // VOICE15 + ESS: algorithm ID and key ID
+                    data[rec + 1] = callData.AlgorithmId;
+                    data[rec + 2] = (byte)(callData.KeyId >> 8);
+                    data[rec + 3] = (byte)callData.KeyId;
+                    break;
+                case 8: // VOICE18 + LSD
+                    data[rec + 1] = callData.LSD1;
+                    data[rec + 2] = callData.LSD2;
+                    break;
+            }
+        }
+
+        private RemoteCallData CreateCallData(uint streamId) => new()
+        {
+            SrcId      = _config.PhonePatch.SourceRid,
+            DstId      = _config.PhonePatch.Talkgroup,
+            LCO        = P25Defines.LC_GROUP,
+            TxStreamID = streamId,
+        };
 
         // ---- DMR / NXDN stubs (required by FneSystemBase) ----
 
@@ -191,40 +316,18 @@ namespace dvmsip.Fne
 
         protected override void KeyResponse(object sender, KeyResponseEvent e) { }
 
-        // ---- Transmit P25 audio toward radios ----
-
-        /// <summary>
-        /// Sends 9 IMBE frames (one LDU1) toward the FNE talkgroup.
-        /// Called by CallStateMachine when the SIP → radio path is active.
-        /// </summary>
-        public void TransmitLdu(uint srcId, uint dstId, byte[][] imbeFrames)
-        {
-            if (imbeFrames.Length != 9)
-                throw new ArgumentException("Exactly 9 IMBE frames required per LDU", nameof(imbeFrames));
-
-            var callData = new RemoteCallData
-            {
-                SrcId      = srcId,
-                DstId      = dstId,
-                LCO        = P25Defines.LC_GROUP,
-                TxStreamID = Peer.pktSeq(),
-            };
-
-            // Build 216-byte LDU1 payload with IMBE frames at verified offsets
-            var payload = new byte[200];
-            CreateP25MessageHdr((byte)P25DUID.LDU1, callData, ref payload);
-
-            for (int i = 0; i < 9; i++)
-                Buffer.BlockCopy(imbeFrames[i], 0, payload, LduImbeOffsets[i], ImbeFrameBytes);
-
-            payload[23] = (byte)(P25_MSG_HDR_SIZE + 9 * ImbeFrameBytes);
-
-            Peer.SendMaster(
-                FneBase.CreateOpcode(Constants.NET_FUNC_PROTOCOL, Constants.NET_PROTOCOL_SUBFUNC_P25),
-                payload, Peer.pktSeq(), callData.TxStreamID);
-        }
-
         // ---- Helpers ----
+
+        private static int ImbeOffset(int index) =>
+            P25_MSG_HDR_SIZE + DfsiRecordOffsets[index] + ImbeOffsetInRecord[index];
+
+        private static bool HasValidDfsiRecords(byte[] data, byte firstTag)
+        {
+            if (data.Length < P25_MSG_HDR_SIZE + DfsiLength) return false;
+            for (int i = 0; i < FramesPerLdu; i++)
+                if (data[P25_MSG_HDR_SIZE + DfsiRecordOffsets[i]] != firstTag + i) return false;
+            return true;
+        }
 
         private CallSlot? FindSlotForIncoming(uint srcId, uint dstId)
         {

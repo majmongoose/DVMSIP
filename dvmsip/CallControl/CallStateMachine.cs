@@ -9,7 +9,6 @@
 
 using dvmsip.Configuration;
 using dvmsip.Sip;
-using dvmsip.Vocoder;
 using fnecore.P25;
 using Serilog;
 using SIPSorcery.Net;
@@ -22,7 +21,7 @@ namespace dvmsip.CallControl
     ///
     /// States:
     ///   IDLE      — monitoring FNE for voice activity, monitoring SIP for inbound INVITEs
-    ///   ACTIVE    — full-duplex audio bridge running (either direction)
+    ///   ACTIVE    — call set up or in progress, full-duplex audio bridge running
     ///   RELEASING — tearing down both sides, draining audio pipelines, returning to IDLE
     ///
     /// Direction is tracked on the active PhonePatchCall object.
@@ -37,8 +36,6 @@ namespace dvmsip.CallControl
 
         private readonly int _slotIndex;
         private readonly DvmSipConfig _config;
-        private readonly RtpBridge _rtp;
-        private readonly AudioBridge _bridge;
 
         // Set by HostService after all subsystems are wired
         public SipService? SipService        { private get; set; }
@@ -46,16 +43,14 @@ namespace dvmsip.CallControl
         public CallSlot? Slot                { private get; set; }
 
         // State accessors
-        public bool IsIdle                => _state == CallState.Idle;
-        public bool IsActive              => _state == CallState.Active;
+        public bool IsIdle                  => _state == CallState.Idle;
+        public bool IsActive                => _state == CallState.Active;
         public bool IsActiveFor(uint dstId) => _state == CallState.Active && _call?.DstId == dstId;
 
-        public CallStateMachine(int slotIndex, DvmSipConfig config, RtpBridge rtp, AudioBridge bridge)
+        public CallStateMachine(int slotIndex, DvmSipConfig config)
         {
             _slotIndex = slotIndex;
             _config    = config;
-            _rtp       = rtp;
-            _bridge    = bridge;
         }
 
         // ---- Events from FNE ----
@@ -71,19 +66,22 @@ namespace dvmsip.CallControl
                 switch (_state)
                 {
                     case CallState.Idle:
-                        // Radio started talking — place an outbound SIP call
+                        if (string.IsNullOrEmpty(_config.PhonePatch.OutboundNumber))
+                            return; // radio-originated calls disabled
+
                         _call = new PhonePatchCall { SrcId = srcId, DstId = dstId, Outbound = true };
                         Transition(CallState.Active, $"P25 voice from RID {srcId} on TG {dstId}");
-                        Task.Run(() => SipService?.PlaceCallAsync(GetSlot()!, _config.PhonePatch.InboundDid));
+
+                        var slot = Slot!;
+                        var sip  = SipService!;
+                        Task.Run(() => sip.PlaceCallAsync(slot, _config.PhonePatch.OutboundNumber));
                         break;
 
                     case CallState.Active:
-                        // Already bridging — just update the DUID
                         if (_call != null) _call.LastDuid = duid;
                         break;
 
                     case CallState.Releasing:
-                        // Ignore frames during teardown
                         break;
                 }
             }
@@ -91,24 +89,32 @@ namespace dvmsip.CallControl
 
         // ---- Events from SIP ----
 
+        /// <summary>
+        /// Atomically claims this slot for an inbound SIP call. Returns false if the slot is no longer idle.
+        /// </summary>
+        public bool TryBeginInbound(string from)
+        {
+            lock (_lock)
+            {
+                if (_state != CallState.Idle) return false;
+
+                _call = new PhonePatchCall
+                {
+                    SrcId    = _config.PhonePatch.SourceRid,
+                    DstId    = _config.PhonePatch.Talkgroup,
+                    Outbound = false,
+                };
+                Transition(CallState.Active, $"Inbound SIP call from {from}");
+                return true;
+            }
+        }
+
         /// <summary>Called when a SIP call is answered (either direction).</summary>
         public void OnSipAnswered(SIPUserAgent ua, RTPSession rtpSession, bool outbound)
         {
             lock (_lock)
             {
-                if (_state == CallState.Releasing) return;
-
-                if (_call == null)
-                {
-                    // Inbound SIP call — radio → SIP was not yet initiated
-                    _call = new PhonePatchCall
-                    {
-                        SrcId    = _config.PhonePatch.SourceRid,
-                        DstId    = _config.PhonePatch.Talkgroup,
-                        Outbound = false,
-                    };
-                    Transition(CallState.Active, "Inbound SIP call answered");
-                }
+                if (_state != CallState.Active || _call == null) return;
 
                 _call.SipUa      = ua;
                 _call.RtpSession = rtpSession;
@@ -132,7 +138,6 @@ namespace dvmsip.CallControl
         {
             lock (_lock)
             {
-                if (_state == CallState.Idle) return;
                 Log.Information("[Slot {Slot}] SIP hangup received", _slotIndex);
                 Teardown("SIP hangup");
             }
@@ -142,14 +147,28 @@ namespace dvmsip.CallControl
 
         private void Teardown(string reason)
         {
-            if (_state == CallState.Idle) return;
+            if (_state != CallState.Active) return;
             Transition(CallState.Releasing, reason);
 
             var call = _call;
             _call = null;
 
+            var slot = Slot!;
+            var sip  = SipService;
+            var fne  = PeerSystem;
+
             Task.Run(() =>
             {
+                try
+                {
+                    sip?.HangupSlot(slot);
+                    fne?.EndTransmit(slot);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error(ex, "[Slot {Slot}] Error during teardown", _slotIndex);
+                }
+
                 if (call != null)
                 {
                     var duration = DateTime.UtcNow - call.StartTime;
@@ -157,18 +176,12 @@ namespace dvmsip.CallControl
                         _slotIndex, call.SrcId, call.DstId, duration);
                 }
 
-                // Brief drain window then return to idle
-                Thread.Sleep(100);
-
                 lock (_lock)
                 {
                     Transition(CallState.Idle, "teardown complete");
                 }
             });
         }
-
-        // ---- Transmit loop: FNE → SIP driven by IMBE-to-PCM pipeline in AudioBridge ----
-        // AudioBridge.PcmToSip → RtpBridge.SendLoop handles this automatically.
 
         // ---- Helpers ----
 
@@ -178,8 +191,6 @@ namespace dvmsip.CallControl
                 _slotIndex, _state, next, reason);
             _state = next;
         }
-
-        private CallSlot? GetSlot() => Slot;
 
         public void Dispose() { /* nothing owned here */ }
     }

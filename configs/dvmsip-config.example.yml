@@ -40,3 +40,4 @@ phonePatch:
   sourceRID: 9000001       # Source RID injected for SIP-originated transmissions
   maxCalls: 1              # Maximum simultaneous phone patch calls
   inboundDID: "1000"       # SIP extension dialled for incoming PSTN/SIP calls
+  outboundNumber: "100"    # Number/extension DVMSIP dials when a radio keys up on the talkgroup
