@@ -589,11 +589,13 @@ Steps 1–3 can be tested with synthetic gateway traffic before any RF testing.
 > - `Vocoder/AudioBridge.cs`: VOX.
 > - Conventional mode uses the same `ICallController` / `IP25CallRouter` seams (`CallStateMachine`, `ConventionalCallRouter`).
 >
-> **Tests:** `tests/dvmsip.Tests`. The RS(24,12,13) port is checked against a reference built from dvmhost's own matrix.
+> **Tests:** `tests/dvmsip.Tests`. The TDULC's RS(24,12,13) output (fnecore `ReedSolomonAlgorithm`) is checked against a reference built from dvmhost's own matrix.
 >
 > **Implementation notes:**
 > - **Call end:** uses an LC_CALL_TERM **TDULC**. The DVM `OSP_DVM_LC_CALL_TERM` TSBK cannot be used: its target field is 16 bits, and RIDs are 24 bits.
-> - **fnecore limitations:** `TSBKBase.Decode` copies the payload from byte 1 (the MFId) instead of byte 2, and fnecore has no TDULC/RS(24,12,13) support. DVMSIP therefore uses fnecore's Trellis, interleaver, Golay and CRC primitives directly.
+> - **fnecore usage:**
+>   - `TSBKBase.Decode` copies the payload from byte 1 (the MFId) instead of byte 2, so DVMSIP parses raw TSBKs itself.
+>   - fnecore has no TDULC framing. DVMSIP builds the TDULC from fnecore's FEC primitives: `ReedSolomonAlgorithm` for RS(24,12,13), plus its Golay, interleaver, Trellis and CRC classes.
 > - **Radio → phone:** the grant is demanded once the SIP party answers, so there is no ringback on the radio yet (no SIP early media).
 > - **Floor control:**
 >   - The transmit gate closes while the unit is keyed (LDUs seen within the last second, until its terminator).

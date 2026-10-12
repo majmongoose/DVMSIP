@@ -10,6 +10,7 @@
 using dvmsip.Fne;
 using fnecore;
 using fnecore.EDAC;
+using fnecore.EDAC.RS;
 using fnecore.P25;
 
 namespace dvmsip.Tests
@@ -21,15 +22,15 @@ namespace dvmsip.Tests
         private const string CallTermRsReference = "4F00000000001234565F261BAA9EE0E44603";
 
         [Fact]
-        public void Rs241213_MatchesDvmhostReference()
+        public void FnecoreRs241213_MatchesDvmhostReference()
         {
-            var rs = new byte[18];
-            rs[0] = 0x4F;
-            rs[6] = 0x12;
-            rs[7] = 0x34;
-            rs[8] = 0x56;
+            var lc = new byte[18];
+            lc[0] = 0x4F;
+            lc[6] = 0x12;
+            lc[7] = 0x34;
+            lc[8] = 0x56;
 
-            Rs241213.Encode(rs);
+            byte[] rs = ReedSolomonAlgorithm.Encode(lc, ErrorCorrectionCodeType.ReedSolomon_241213);
 
             Assert.Equal(CallTermRsReference, Convert.ToHexString(rs));
         }

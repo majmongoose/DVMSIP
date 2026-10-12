@@ -1,5 +1,8 @@
 # DVMSIP — DVM SIP Telephone Interconnect
 
+> [!WARNING]
+> **This software was written mostly by AI, with human oversight.** Review it carefully before relying on it, especially on a live radio system.
+
 DVMSIP connects a [Digital Voice Modem](https://github.com/DVMProject) P25 network to a SIP PBX or SIP trunk, so radios can make and receive telephone calls. It joins the network as an FNE peer (via [fnecore](https://github.com/DVMProject/fnecore)), converts P25 IMBE voice to and from G.711 µ-law with [dvmvocoder](https://github.com/DVMProject/dvmvocoder), and handles SIP and RTP with [SIPSorcery](https://github.com/sipsorcery-org/sipsorcery).
 
 It runs on Windows, Linux and macOS (.NET 8).
@@ -70,7 +73,7 @@ cp extern/dvmvocoder/build/libvocoder.so publish/
 dotnet test tests/dvmsip.Tests/dvmsip.Tests.csproj
 ```
 
-The tests cover the P25 wire formats DVMSIP builds itself, including a check of its Reed-Solomon encoder against dvmhost's, and confirm the example configuration loads. They do not need the vocoder library.
+The tests cover the P25 wire formats DVMSIP builds itself, including the call-termination TDULC's FEC against a dvmhost reference, and confirm the example configuration loads. They do not need the vocoder library.
 
 ## Configuration
 
