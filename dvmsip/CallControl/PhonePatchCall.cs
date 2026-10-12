@@ -7,10 +7,6 @@
  *
  */
 
-using fnecore.P25;
-using SIPSorcery.Net;
-using SIPSorcery.SIP.App;
-
 namespace dvmsip.CallControl
 {
     /// <summary>
@@ -22,10 +18,6 @@ namespace dvmsip.CallControl
         public uint DstId    { get; set; }
         public bool Outbound { get; set; }
 
-        public SIPUserAgent? SipUa       { get; set; }
-        public RTPSession?   RtpSession  { get; set; }
-
         public DateTime StartTime { get; } = DateTime.UtcNow;
-        public P25DUID LastDuid   { get; set; }
     }
 }

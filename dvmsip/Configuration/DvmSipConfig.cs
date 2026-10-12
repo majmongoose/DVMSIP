@@ -107,6 +107,29 @@ namespace dvmsip.Configuration
 
         [YamlMember(Alias = "outboundNumber")]
         public string OutboundNumber { get; set; } = "";
+
+        /// <summary>Trunked: telephone numbers for P25 implicit dialing, keyed by PSTN address (0 - 255).</summary>
+        [YamlMember(Alias = "presetNumbers")]
+        public Dictionary<int, string> PresetNumbers { get; set; } = new();
+
+        /// <summary>Trunked: inbound SIP DID (request URI user) to the radio ID it rings.</summary>
+        [YamlMember(Alias = "didMap")]
+        public Dictionary<string, uint> DidMap { get; set; } = new();
+
+        /// <summary>Trunked: seconds to wait for a radio to answer an inbound call.</summary>
+        [YamlMember(Alias = "answerTimeout")]
+        public int AnswerTimeout { get; set; } = 30;
+
+        /// <summary>Voice activity threshold (RMS of 16-bit PCM) for keying phone audio onto the radio side.</summary>
+        [YamlMember(Alias = "voxThreshold")]
+        public int VoxThreshold { get; set; } = 500;
+
+        /// <summary>Milliseconds of silence before a phone-audio transmission is ended.</summary>
+        [YamlMember(Alias = "voxHangTime")]
+        public int VoxHangTime { get; set; } = 600;
+
+        [YamlIgnore]
+        public bool IsTrunked => string.Equals(Mode, "trunked", StringComparison.OrdinalIgnoreCase);
     }
 
     public class DvmSipConfig

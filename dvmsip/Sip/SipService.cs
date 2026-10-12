@@ -21,7 +21,7 @@ namespace dvmsip.Sip
     /// <summary>
     /// Manages SIP registration, inbound call acceptance and outbound dialling.
     /// Each call slot owns its own SIPUserAgent (a SIPSorcery UA carries one dialog at a time);
-    /// a separate listener UA receives new INVITEs and hands them to an idle slot's UA.
+    /// a separate listener UA receives new INVITEs and hands them to the slot whose controller claims them.
     /// Offers only PCMU (PT 0) in SDP.
     /// </summary>
     internal sealed class SipService : IDisposable
@@ -59,7 +59,7 @@ namespace dvmsip.Sip
             {
                 var ua = new SIPUserAgent(_transport, null);
                 var capturedSlot = slot;
-                ua.OnCallHungup += _ => capturedSlot.StateMachine.OnSipHangup();
+                ua.OnCallHungup += _ => capturedSlot.Controller.OnSipHangup();
                 ua.OnDtmfTone   += (tone, duration) =>
                     Log.Information("[SIP] DTMF tone {Tone} received ({Duration}ms)", tone, duration);
                 _slotUas[slot] = ua;
@@ -102,55 +102,57 @@ namespace dvmsip.Sip
         private void OnIncomingCall(SIPUserAgent listener, SIPRequest req)
         {
             string from = req.Header.From?.FromURI?.ToString() ?? "unknown";
-            Log.Information("[SIP] Incoming call from {From} to {To}", from, req.Header.To?.ToURI);
+            string callerNumber = req.Header.From?.FromURI?.User ?? "";
+            string toUser = req.URI?.User ?? "";
+            Log.Information("[SIP] Incoming call from {From} to {To}", from, toUser);
 
             CallSlot? slot = null;
             foreach (var s in _slots)
             {
-                if (s.StateMachine.TryBeginInbound(from)) { slot = s; break; }
+                if (s.Controller.TryBeginInbound(from, toUser)) { slot = s; break; }
             }
 
             if (slot == null)
             {
-                Log.Warning("[SIP] No idle call slots — rejecting inbound call");
+                Log.Warning("[SIP] No call slot can take the inbound call to {To} — rejecting", toUser);
                 listener.AcceptCall(req).Reject(SIPResponseStatusCodesEnum.BusyHere, null);
                 return;
             }
 
             var ua  = _slotUas[slot];
             var uas = ua.AcceptCall(req);
-            var rtpSession = CreateRtpSession(slot.RtpBridge.RtpPort);
-            slot.RtpBridge.Attach(rtpSession);
+            uas.CallCancelled += (_, _) => slot.Controller.OnSipHangup();
 
-            Task.Run(async () =>
+            slot.Controller.OnInboundCall(new InboundCall(this, slot, ua, uas, from, callerNumber, toUser));
+        }
+
+        /// <summary>Answers a bound inbound call and attaches its media to the slot.</summary>
+        public async Task<bool> AnswerAsync(InboundCall call)
+        {
+            var rtpSession = CreateRtpSession(call.Slot.RtpBridge.RtpPort);
+            call.Slot.RtpBridge.Attach(rtpSession);
+
+            try
             {
-                bool answered;
-                try
+                if (await call.Ua.Answer(call.Uas, rtpSession, null))
                 {
-                    answered = await ua.Answer(uas, rtpSession, null);
+                    Log.Information("[SIP] Inbound call from {From} answered", call.From);
+                    return true;
                 }
-                catch (Exception ex)
-                {
-                    Log.Error(ex, "[SIP] Error answering inbound call");
-                    answered = false;
-                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, "[SIP] Error answering inbound call");
+            }
 
-                if (answered)
-                {
-                    Log.Information("[SIP] Inbound call answered");
-                    slot.StateMachine.OnSipAnswered(ua, rtpSession, outbound: false);
-                }
-                else
-                {
-                    Log.Warning("[SIP] Inbound call answer failed");
-                    slot.StateMachine.OnSipFailed();
-                }
-            });
+            Log.Warning("[SIP] Inbound call answer failed");
+            return false;
         }
 
         // ---- Outbound calls ----
 
-        public async Task PlaceCallAsync(CallSlot slot, string dialledNumber)
+        /// <summary>Dials <paramref name="dialledNumber"/> from the slot. Returns true once the call is answered.</summary>
+        public async Task<bool> PlaceCallAsync(CallSlot slot, string dialledNumber)
         {
             var ua  = _slotUas[slot];
             string uri = $"sip:{dialledNumber}@{_config.Sip.Realm}";
@@ -159,27 +161,21 @@ namespace dvmsip.Sip
             var rtpSession = CreateRtpSession(slot.RtpBridge.RtpPort);
             slot.RtpBridge.Attach(rtpSession);
 
-            bool connected;
             try
             {
-                connected = await ua.Call(uri, _config.Sip.User, _config.Sip.Password, rtpSession, 60);
+                if (await ua.Call(uri, _config.Sip.User, _config.Sip.Password, rtpSession, 60))
+                {
+                    Log.Information("[SIP] Outbound call connected to {Uri}", uri);
+                    return true;
+                }
             }
             catch (Exception ex)
             {
                 Log.Error(ex, "[SIP] Error placing outbound call to {Uri}", uri);
-                connected = false;
             }
 
-            if (connected)
-            {
-                Log.Information("[SIP] Outbound call connected to {Uri}", uri);
-                slot.StateMachine.OnSipAnswered(ua, rtpSession, outbound: true);
-            }
-            else
-            {
-                Log.Warning("[SIP] Outbound call failed to {Uri}", uri);
-                slot.StateMachine.OnSipFailed();
-            }
+            Log.Warning("[SIP] Outbound call failed to {Uri}", uri);
+            return false;
         }
 
         /// <summary>Hangs up the slot's SIP dialog (if still up) and closes its RTP session.</summary>

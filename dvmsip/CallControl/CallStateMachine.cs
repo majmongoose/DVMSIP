@@ -11,8 +11,6 @@ using dvmsip.Configuration;
 using dvmsip.Sip;
 using fnecore.P25;
 using Serilog;
-using SIPSorcery.Net;
-using SIPSorcery.SIP.App;
 
 namespace dvmsip.CallControl
 {
@@ -26,7 +24,7 @@ namespace dvmsip.CallControl
     ///
     /// Direction is tracked on the active PhonePatchCall object.
     /// </summary>
-    internal sealed class CallStateMachine : IDisposable
+    internal sealed class CallStateMachine : ICallController
     {
         public enum CallState { Idle, Active, Releasing }
 
@@ -34,65 +32,59 @@ namespace dvmsip.CallControl
         private PhonePatchCall? _call;
         private readonly object _lock = new();
 
-        private readonly int _slotIndex;
         private readonly DvmSipConfig _config;
 
-        // Set by HostService after all subsystems are wired
-        public SipService? SipService        { private get; set; }
-        public Fne.SipPeerSystem? PeerSystem { private get; set; }
-        public CallSlot? Slot                { private get; set; }
+        public CallSlot Slot { get; }
+        public SipService SipService { private get; set; } = null!;
+        public Fne.SipPeerSystem PeerSystem { private get; set; } = null!;
 
         // State accessors
         public bool IsIdle                  => _state == CallState.Idle;
         public bool IsActive                => _state == CallState.Active;
+        public bool CanTransmit             => IsActive;
         public bool IsActiveFor(uint dstId) => _state == CallState.Active && _call?.DstId == dstId;
 
-        public CallStateMachine(int slotIndex, DvmSipConfig config)
+        public TransmitTarget Target =>
+            new(_config.PhonePatch.SourceRid, _config.PhonePatch.Talkgroup, P25Defines.LC_GROUP, Individual: false);
+
+        public CallStateMachine(CallSlot slot, DvmSipConfig config)
         {
-            _slotIndex = slotIndex;
-            _config    = config;
+            Slot    = slot;
+            _config = config;
         }
 
         // ---- Events from FNE ----
 
         /// <summary>
-        /// Called by SipPeerSystem each time a P25 LDU arrives on the configured talkgroup.
+        /// Called each time a P25 LDU arrives on the configured talkgroup.
         /// Triggers an outbound SIP call if we are idle (radio → SIP direction).
         /// </summary>
         public void OnP25AudioReceived(uint srcId, uint dstId, P25DUID duid)
         {
             lock (_lock)
             {
-                switch (_state)
-                {
-                    case CallState.Idle:
-                        if (string.IsNullOrEmpty(_config.PhonePatch.OutboundNumber))
-                            return; // radio-originated calls disabled
+                if (_state != CallState.Idle)
+                    return;
 
-                        _call = new PhonePatchCall { SrcId = srcId, DstId = dstId, Outbound = true };
-                        Transition(CallState.Active, $"P25 voice from RID {srcId} on TG {dstId}");
+                if (string.IsNullOrEmpty(_config.PhonePatch.OutboundNumber))
+                    return; // radio-originated calls disabled
 
-                        var slot = Slot!;
-                        var sip  = SipService!;
-                        Task.Run(() => sip.PlaceCallAsync(slot, _config.PhonePatch.OutboundNumber));
-                        break;
-
-                    case CallState.Active:
-                        if (_call != null) _call.LastDuid = duid;
-                        break;
-
-                    case CallState.Releasing:
-                        break;
-                }
+                _call = new PhonePatchCall { SrcId = srcId, DstId = dstId, Outbound = true };
+                Transition(CallState.Active, $"P25 voice from RID {srcId} on TG {dstId}");
             }
+
+            Task.Run(async () =>
+            {
+                if (await SipService.PlaceCallAsync(Slot, _config.PhonePatch.OutboundNumber))
+                    OnSipAnswered(outbound: true);
+                else
+                    OnSipFailed();
+            });
         }
 
         // ---- Events from SIP ----
 
-        /// <summary>
-        /// Atomically claims this slot for an inbound SIP call. Returns false if the slot is no longer idle.
-        /// </summary>
-        public bool TryBeginInbound(string from)
+        public bool TryBeginInbound(string from, string toUser)
         {
             lock (_lock)
             {
@@ -109,37 +101,43 @@ namespace dvmsip.CallControl
             }
         }
 
-        /// <summary>Called when a SIP call is answered (either direction).</summary>
-        public void OnSipAnswered(SIPUserAgent ua, RTPSession rtpSession, bool outbound)
+        public void OnInboundCall(InboundCall call)
         {
-            lock (_lock)
+            Task.Run(async () =>
             {
-                if (_state != CallState.Active || _call == null) return;
-
-                _call.SipUa      = ua;
-                _call.RtpSession = rtpSession;
-
-                Log.Information("[Slot {Slot}] Call active — SRC {SrcId} TG {DstId} {Dir}",
-                    _slotIndex, _call.SrcId, _call.DstId,
-                    outbound ? "radio→SIP" : "SIP→radio");
-            }
-        }
-
-        public void OnSipFailed()
-        {
-            lock (_lock)
-            {
-                Log.Warning("[Slot {Slot}] SIP call failed — returning to IDLE", _slotIndex);
-                Teardown("SIP call failed");
-            }
+                if (await call.AnswerAsync())
+                    OnSipAnswered(outbound: false);
+                else
+                    OnSipFailed();
+            });
         }
 
         public void OnSipHangup()
         {
             lock (_lock)
             {
-                Log.Information("[Slot {Slot}] SIP hangup received", _slotIndex);
+                Log.Information("[Slot {Slot}] SIP hangup received", Slot.Index);
                 Teardown("SIP hangup");
+            }
+        }
+
+        private void OnSipAnswered(bool outbound)
+        {
+            lock (_lock)
+            {
+                if (_state != CallState.Active || _call == null) return;
+
+                Log.Information("[Slot {Slot}] Call active — SRC {SrcId} TG {DstId} {Dir}",
+                    Slot.Index, _call.SrcId, _call.DstId, outbound ? "radio→SIP" : "SIP→radio");
+            }
+        }
+
+        private void OnSipFailed()
+        {
+            lock (_lock)
+            {
+                Log.Warning("[Slot {Slot}] SIP call failed — returning to IDLE", Slot.Index);
+                Teardown("SIP call failed");
             }
         }
 
@@ -153,27 +151,23 @@ namespace dvmsip.CallControl
             var call = _call;
             _call = null;
 
-            var slot = Slot!;
-            var sip  = SipService;
-            var fne  = PeerSystem;
-
             Task.Run(() =>
             {
                 try
                 {
-                    sip?.HangupSlot(slot);
-                    fne?.EndTransmit(slot);
+                    SipService.HangupSlot(Slot);
+                    PeerSystem.EndTransmit(Slot);
                 }
                 catch (Exception ex)
                 {
-                    Log.Error(ex, "[Slot {Slot}] Error during teardown", _slotIndex);
+                    Log.Error(ex, "[Slot {Slot}] Error during teardown", Slot.Index);
                 }
 
                 if (call != null)
                 {
                     var duration = DateTime.UtcNow - call.StartTime;
                     Log.Information("[Slot {Slot}] Call ended — RID {SrcId} TG {DstId} duration {Dur:g}",
-                        _slotIndex, call.SrcId, call.DstId, duration);
+                        Slot.Index, call.SrcId, call.DstId, duration);
                 }
 
                 lock (_lock)
@@ -188,10 +182,8 @@ namespace dvmsip.CallControl
         private void Transition(CallState next, string reason)
         {
             Log.Information("[Slot {Slot}] Call state {Old} → {New}: {Reason}",
-                _slotIndex, _state, next, reason);
+                Slot.Index, _state, next, reason);
             _state = next;
         }
-
-        public void Dispose() { /* nothing owned here */ }
     }
 }

@@ -18,15 +18,18 @@ namespace dvmsip.CallControl
     /// </summary>
     internal sealed class CallSlot : IDisposable
     {
-        public AudioBridge      Bridge       { get; }
-        public RtpBridge        RtpBridge    { get; }
-        public CallStateMachine StateMachine { get; }
+        public int Index { get; }
+        public AudioBridge Bridge { get; }
+        public RtpBridge RtpBridge { get; }
 
-        public CallSlot(AudioBridge bridge, RtpBridge rtpBridge, CallStateMachine stateMachine)
+        /// <summary>Set by HostService once the mode-specific controller has been created.</summary>
+        public ICallController Controller { get; set; } = null!;
+
+        public CallSlot(int index, AudioBridge bridge, RtpBridge rtpBridge)
         {
-            Bridge       = bridge;
-            RtpBridge    = rtpBridge;
-            StateMachine = stateMachine;
+            Index     = index;
+            Bridge    = bridge;
+            RtpBridge = rtpBridge;
         }
 
         public void Start()
@@ -36,7 +39,6 @@ namespace dvmsip.CallControl
 
         public void Dispose()
         {
-            StateMachine.Dispose();
             RtpBridge.Dispose();
             Bridge.Dispose();
         }

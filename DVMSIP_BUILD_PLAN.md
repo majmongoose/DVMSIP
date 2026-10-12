@@ -580,6 +580,26 @@ Steps 1–3 can be tested with synthetic gateway traffic before any RF testing.
 
 ### DVMSIP Phase 3 tasks
 
+> **Status: implemented, untested against a live system.** Set `phonePatch.mode: trunked` to enable.
+>
+> **Code:**
+> - `CallControl/InterconnectCall.cs`: per-slot controller (states, keepalive, alerting, teardown).
+> - `CallControl/InterconnectManager.cs`: TSBK and voice routing by RID.
+> - `Fne/P25Tsbk.cs`, `Fne/P25Tdulc.cs`: wire formats.
+> - `Vocoder/AudioBridge.cs`: VOX.
+> - Conventional mode uses the same `ICallController` / `IP25CallRouter` seams (`CallStateMachine`, `ConventionalCallRouter`).
+>
+> **Tests:** `tests/dvmsip.Tests`. The RS(24,12,13) port is checked against a reference built from dvmhost's own matrix.
+>
+> **Implementation notes:**
+> - **Call end:** uses an LC_CALL_TERM **TDULC**. The DVM `OSP_DVM_LC_CALL_TERM` TSBK cannot be used: its target field is 16 bits, and RIDs are 24 bits.
+> - **fnecore limitations:** `TSBKBase.Decode` copies the payload from byte 1 (the MFId) instead of byte 2, and fnecore has no TDULC/RS(24,12,13) support. DVMSIP therefore uses fnecore's Trellis, interleaver, Golay and CRC primitives directly.
+> - **Radio → phone:** the grant is demanded once the SIP party answers, so there is no ringback on the radio yet (no SIP early media).
+> - **Floor control:**
+>   - The transmit gate closes while the unit is keyed (LDUs seen within the last second, until its terminator).
+>   - An FNE in-call-control `REJECT_TRAFFIC` also closes it.
+> - **Not yet supported:** explicit dialing (multi-block ISP).
+
 #### Task 12 — Per-unit interconnect state machine
 
 Calls are keyed by **RID**, not talkgroup:

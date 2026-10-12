@@ -4,6 +4,7 @@
  * AGPLv3 Open Source. Use is subject to license terms.
  *
  *   Copyright (C) 2024 DVMProject Contributors
+ *   Copyright (C) 2026 Charles Bricker, K3NOP
  *
  */
 
@@ -19,7 +20,7 @@ using Serilog;
 namespace dvmsip.Fne
 {
     /// <summary>
-    /// FNE peer that receives P25 voice from the network and injects audio back.
+    /// FNE peer that receives P25 traffic from the network and injects audio and signalling back.
     /// Extends fnecore.FneSystemBase following the pattern in DVMProject/dvmconsole/PeerSystem.cs.
     /// </summary>
     internal sealed class SipPeerSystem : FneSystemBase
@@ -40,6 +41,9 @@ namespace dvmsip.Fne
 
         public FnePeer Peer => (FnePeer)fne;
 
+        /// <summary>Routes received traffic to call slots. Set by HostService before Start().</summary>
+        public IP25CallRouter Router { private get; set; } = null!;
+
         private sealed class TxState
         {
             public readonly byte[][] Frames = new byte[FramesPerLdu][];
@@ -47,6 +51,7 @@ namespace dvmsip.Fne
             public uint StreamId;
             public ushort Seq;
             public bool NextIsLdu2;
+            public TransmitTarget Target;
         }
 
         // ---- Constructor ----
@@ -62,6 +67,7 @@ namespace dvmsip.Fne
 
             // PeerDisconnected is an Action<uint> delegate on FnePeer (not an abstract override)
             Peer.PeerDisconnected = OnPeerDisconnected;
+            Peer.P25InCallControl += OnP25InCallControl;
         }
 
         private static FnePeer CreatePeer(DvmSipConfig config)
@@ -116,10 +122,33 @@ namespace dvmsip.Fne
 
         protected override void P25DataReceived(object sender, P25DataReceivedEvent e)
         {
-            // Only handle voice LDUs for the configured talkgroup
-            if (e.DstId != _config.PhonePatch.Talkgroup) return;
-            if (e.DUID != P25DUID.LDU1 && e.DUID != P25DUID.LDU2) return;
+            if (e.Data.Length < P25_MSG_HDR_SIZE) return;
 
+            byte lco  = e.Data[4];
+            byte mfId = e.Data[15];
+
+            switch (e.DUID)
+            {
+                case P25DUID.TSDU:
+                    byte[]? tsbk = P25Tsbk.Decode(e.Data);
+                    if (tsbk != null)
+                        Router.OnTsbk(tsbk);
+                    break;
+
+                case P25DUID.TDU:
+                case P25DUID.TDULC:
+                    Router.OnTerminator(e.SrcId, e.DstId, lco);
+                    break;
+
+                case P25DUID.LDU1:
+                case P25DUID.LDU2:
+                    OnVoice(e, lco, mfId);
+                    break;
+            }
+        }
+
+        private void OnVoice(P25DataReceivedEvent e, byte lco, byte mfId)
+        {
             byte firstTag = e.DUID == P25DUID.LDU1 ? P25DFSI.P25_DFSI_LDU1_VOICE1 : P25DFSI.P25_DFSI_LDU2_VOICE10;
             if (!HasValidDfsiRecords(e.Data, firstTag))
             {
@@ -127,8 +156,8 @@ namespace dvmsip.Fne
                 return;
             }
 
-            // Find a slot that is active for this talkgroup, or the first idle slot
-            var slot = FindSlotForIncoming(e.SrcId, e.DstId);
+            bool standardMfId = mfId == P25Defines.P25_MFG_STANDARD || mfId == DvmNetDefines.MfgStandardAlt;
+            var slot = Router.OnVoice(e.SrcId, e.DstId, lco, standardMfId, e.DUID);
             if (slot == null) return;
 
             for (int i = 0; i < FramesPerLdu; i++)
@@ -137,8 +166,15 @@ namespace dvmsip.Fne
                 Buffer.BlockCopy(e.Data, ImbeOffset(i), imbe, 0, ImbeFrameBytes);
                 slot.Bridge.ImbeInbound.Writer.TryWrite(imbe);
             }
+        }
 
-            slot.StateMachine.OnP25AudioReceived(e.SrcId, e.DstId, e.DUID);
+        private void OnP25InCallControl(object? sender, P25InCallControlEvent e)
+        {
+            if (e.Command == Constants.NET_ICC_REJECT_TRAFFIC)
+            {
+                Log.Debug("[FNE] Traffic rejected by the FNE, dstId = {DstId}", e.DstId);
+                Router.OnTrafficRejected(e.DstId);
+            }
         }
 
         protected override void PeerConnected(object sender, PeerConnectedEvent e)
@@ -155,7 +191,7 @@ namespace dvmsip.Fne
 
         /// <summary>
         /// Starts a background task per slot that drains ImbeToFne and transmits alternating
-        /// LDU1/LDU2 toward the FNE talkgroup (SIP → radio direction).
+        /// LDU1/LDU2 toward the slot's transmit target (SIP → radio direction).
         /// </summary>
         public void StartTransmitLoops(CancellationToken ct)
         {
@@ -173,16 +209,21 @@ namespace dvmsip.Fne
             {
                 await foreach (var imbe in slot.Bridge.ImbeToFne.Reader.ReadAllAsync(ct))
                 {
-                    // Drop codec tail frames that arrive after the call has been torn down,
-                    // otherwise they would open a new stream that is never terminated.
-                    if (!slot.StateMachine.IsActive) continue;
+                    // an empty frame marks the end of a voice burst; frames are also dropped (ending any
+                    // open stream) while the controller cannot transmit, e.g. after teardown or while the
+                    // radio holds the floor
+                    if (imbe.Length == 0 || !slot.Controller.CanTransmit)
+                    {
+                        EndTransmit(slot);
+                        continue;
+                    }
 
                     lock (tx)
                     {
                         tx.Frames[tx.FrameCount++] = imbe;
                         if (tx.FrameCount < FramesPerLdu) continue;
                         tx.FrameCount = 0;
-                        SendLdu(tx);
+                        SendLdu(tx, slot.Controller.Target);
                     }
                 }
             }
@@ -202,27 +243,29 @@ namespace dvmsip.Fne
                 tx.FrameCount = 0;
                 if (tx.StreamId == 0) return;
 
-                SendP25TDU(CreateCallData(tx.StreamId));
+                SendTdu(CreateCallData(tx.Target, tx.StreamId), Individual(tx.Target));
                 Log.Debug("[FNE] Sent TDU for stream {StreamId}", tx.StreamId);
                 tx.StreamId = 0;
             }
         }
 
-        private void SendLdu(TxState tx)
+        private void SendLdu(TxState tx, TransmitTarget target)
         {
             if (tx.StreamId == 0)
             {
-                tx.StreamId   = (uint)Random.Shared.Next(1, int.MaxValue);
+                tx.StreamId   = NewStreamId();
                 tx.Seq        = 0;
                 tx.NextIsLdu2 = false;
+                tx.Target     = target;
             }
 
-            var callData = CreateCallData(tx.StreamId);
+            var callData = CreateCallData(tx.Target, tx.StreamId);
             bool ldu2    = tx.NextIsLdu2;
             var  duid    = ldu2 ? P25DUID.LDU2 : P25DUID.LDU1;
 
             var payload = new byte[ldu2 ? Constants.P25LDU2PacketLength : Constants.P25LDU1PacketLength];
             CreateP25MessageHdr((byte)duid, callData, ref payload);
+            payload[14] |= Individual(tx.Target);
 
             byte firstTag = ldu2 ? P25DFSI.P25_DFSI_LDU2_VOICE10 : P25DFSI.P25_DFSI_LDU1_VOICE1;
             for (int i = 0; i < FramesPerLdu; i++)
@@ -288,13 +331,81 @@ namespace dvmsip.Fne
             }
         }
 
-        private RemoteCallData CreateCallData(uint streamId) => new()
+        // ---- Telephone interconnect signalling (trunked mode) ----
+
+        /// <summary>Demands (or keeps alive) the voice channel grant for an interconnect call to <paramref name="rid"/>.</summary>
+        public void SendGrantDemand(uint rid)
         {
-            SrcId      = _config.PhonePatch.SourceRid,
-            DstId      = _config.PhonePatch.Talkgroup,
-            LCO        = P25Defines.LC_GROUP,
+            SendTdu(CreateTelIntCallData(rid), DvmNetDefines.NetCtrlGrantDemand | DvmNetDefines.NetCtrlU2U);
+        }
+
+        /// <summary>Tells the site to deny <paramref name="rid"/>'s interconnect request.</summary>
+        public void SendGrantDenial(uint rid)
+        {
+            SendTdu(CreateTelIntCallData(rid),
+                DvmNetDefines.NetCtrlGrantDemand | DvmNetDefines.NetCtrlGrantDenial | DvmNetDefines.NetCtrlU2U);
+        }
+
+        /// <summary>Alerts <paramref name="rid"/> of an inbound call from <paramref name="callerNumber"/>.</summary>
+        public void SendAnswerRequest(uint rid, string callerNumber)
+        {
+            var callData = CreateTelIntCallData(rid);
+            callData.LCO = P25Defines.TSBK_IOSP_TELE_INT_ANS;
+            SendP25TSBK(callData, P25Tsbk.AnswerRequest(rid, callerNumber));
+        }
+
+        /// <summary>Ends the interconnect call to <paramref name="rid"/> (LC_CALL_TERM TDULC); releases the grant.</summary>
+        public void SendCallTerm(uint rid)
+        {
+            var callData = CreateTelIntCallData(rid);
+
+            // CreateP25MessageHdr writes the frame type at byte 180, beyond a TDULC message
+            var header = new byte[200];
+            CreateP25MessageHdr((byte)P25DUID.TDULC, callData, ref header);
+
+            var payload = new byte[Constants.P25TDULCPacketLength];
+            Buffer.BlockCopy(header, 0, payload, 0, P25_MSG_HDR_SIZE);
+            payload[14] |= DvmNetDefines.NetCtrlU2U;
+
+            byte[] frame = P25Tdulc.CallTermFrame(rid);
+            Buffer.BlockCopy(frame, 0, payload, P25_MSG_HDR_SIZE, frame.Length);
+            payload[23] = (byte)frame.Length;
+
+            Peer.pktSeq(true);
+            Peer.SendMaster(
+                FneBase.CreateOpcode(Constants.NET_FUNC_PROTOCOL, Constants.NET_PROTOCOL_SUBFUNC_P25),
+                payload, Constants.RtpCallEndSeq, callData.TxStreamID);
+        }
+
+        private void SendTdu(RemoteCallData callData, byte controlByte)
+        {
+            var payload = new byte[200];
+            CreateP25MessageHdr((byte)P25DUID.TDU, callData, ref payload);
+            payload[23] = P25_MSG_HDR_SIZE;
+            payload[14] |= controlByte;
+
+            Peer.pktSeq(true);
+            Peer.SendMaster(
+                FneBase.CreateOpcode(Constants.NET_FUNC_PROTOCOL, Constants.NET_PROTOCOL_SUBFUNC_P25),
+                payload, Constants.RtpCallEndSeq, callData.TxStreamID);
+        }
+
+        private RemoteCallData CreateTelIntCallData(uint rid) => CreateCallData(
+            new TransmitTarget(_config.PhonePatch.SourceRid, rid, P25Defines.LC_TEL_INT_VCH_USER, Individual: true),
+            NewStreamId());
+
+        private static RemoteCallData CreateCallData(TransmitTarget target, uint streamId) => new()
+        {
+            SrcId      = target.SrcId,
+            DstId      = target.DstId,
+            LCO        = target.Lco,
             TxStreamID = streamId,
         };
+
+        private static byte Individual(TransmitTarget target) =>
+            target.Individual ? DvmNetDefines.NetCtrlU2U : (byte)0;
+
+        private static uint NewStreamId() => (uint)Random.Shared.Next(1, int.MaxValue);
 
         // ---- DMR / NXDN stubs (required by FneSystemBase) ----
 
@@ -327,19 +438,6 @@ namespace dvmsip.Fne
             for (int i = 0; i < FramesPerLdu; i++)
                 if (data[P25_MSG_HDR_SIZE + DfsiRecordOffsets[i]] != firstTag + i) return false;
             return true;
-        }
-
-        private CallSlot? FindSlotForIncoming(uint srcId, uint dstId)
-        {
-            // Prefer a slot already active for this stream
-            foreach (var slot in _slots)
-                if (slot.StateMachine.IsActiveFor(dstId)) return slot;
-
-            // Otherwise take first idle slot
-            foreach (var slot in _slots)
-                if (slot.StateMachine.IsIdle) return slot;
-
-            return null;
         }
     }
 }

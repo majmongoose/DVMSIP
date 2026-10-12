@@ -54,6 +54,13 @@ namespace dvmsip.Vocoder
         private readonly int _maxPlayoutFrames;
         private volatile bool _callActive;
 
+        // ---- Voice activity (SIP → FNE) ----
+
+        private readonly int _voxThreshold;
+        private readonly long _voxHangMs;
+        private volatile bool _voxActive;
+        private long _voxLastVoice;
+
         // ---- Threads ----
 
         private readonly Thread _decodeThread;
@@ -64,10 +71,15 @@ namespace dvmsip.Vocoder
         private bool _started;
         private bool _disposed;
 
-        public AudioBridge(int jitterMs = 360)
+        /// <param name="jitterMs">Playout jitter buffer depth in milliseconds.</param>
+        /// <param name="voxThreshold">RMS level that keys SIP → FNE audio; 0 sends all audio continuously.</param>
+        /// <param name="voxHangMs">Silence in milliseconds before a keyed burst ends.</param>
+        public AudioBridge(int jitterMs = 360, int voxThreshold = 0, int voxHangMs = 0)
         {
             // Each IMBE frame = 20 ms; cap buffer at jitterMs / 20, minimum 3 frames
             _maxPlayoutFrames = Math.Max(3, jitterMs / 20);
+            _voxThreshold = Math.Max(0, voxThreshold);
+            _voxHangMs = Math.Max(0, voxHangMs);
 
             _decodeThread  = NewThread("dvmsip-decode", DecodeLoop);
             _encodeThread  = NewThread("dvmsip-encode", EncodeLoop);
@@ -106,6 +118,7 @@ namespace dvmsip.Vocoder
 
         private void ClearBuffers()
         {
+            _voxActive = false;
             lock (_playoutQueue) _playoutQueue.Clear();
             while (PcmToSip.Reader.TryRead(out _)) { }
             while (ImbeToFne.Reader.TryRead(out _)) { }
@@ -140,11 +153,41 @@ namespace dvmsip.Vocoder
             {
                 while (reader.TryRead(out var pcm))
                 {
+                    if (_voxThreshold > 0 && !VoxGate(pcm))
+                        continue;
+
                     var imbeFrame = new byte[ImbeVocoder.ImbeFrameBytes];
                     _vocoder!.Encode(pcm, imbeFrame);
                     ImbeToFne.Writer.TryWrite(imbeFrame);
                 }
             }, reader.WaitToReadAsync);
+        }
+
+        /// <summary>
+        /// Returns true while the SIP party is talking. When a burst ends, an empty frame is written to
+        /// ImbeToFne so the transmit side terminates the stream.
+        /// </summary>
+        private bool VoxGate(short[] pcm)
+        {
+            double sum = 0;
+            foreach (short s in pcm)
+                sum += (double)s * s;
+
+            long now = Environment.TickCount64;
+            if (Math.Sqrt(sum / pcm.Length) >= _voxThreshold)
+            {
+                _voxLastVoice = now;
+                _voxActive = true;
+                return true;
+            }
+
+            if (_voxActive && now - _voxLastVoice > _voxHangMs)
+            {
+                _voxActive = false;
+                ImbeToFne.Writer.TryWrite(Array.Empty<byte>());
+            }
+
+            return _voxActive;
         }
 
         private void RunLoop(string name, Action drain, Func<CancellationToken, ValueTask<bool>> waitToRead)

@@ -35,9 +35,21 @@ rtp:
   dtmfRelay: true          # Relay RFC 4733 telephone-event DTMF (logging only in Phase 1/2)
 
 phonePatch:
-  mode: "conventional"     # "conventional" only in Phase 1/2 (trunked requires dvmhost PR)
+  mode: "conventional"     # "conventional" = talkgroup patch; "trunked" = P25 telephone interconnect (needs dvmhost
+                           #   with interconnect support, telephoneInterconnect enabled on the control channel, and this
+                           #   peer flagged as a telephone interconnect gateway in the FNE peer list)
   talkgroup: 1             # Talkgroup to bridge in conventional mode
   sourceRID: 9000001       # Source RID injected for SIP-originated transmissions
   maxCalls: 1              # Maximum simultaneous phone patch calls
   inboundDID: "1000"       # SIP extension dialled for incoming PSTN/SIP calls
   outboundNumber: "100"    # Number/extension DVMSIP dials when a radio keys up on the talkgroup
+
+  # ---- trunked mode ----
+  presetNumbers:           # Numbers for P25 implicit dialing (radio speed-dial), keyed by PSTN address 0 - 255
+    1: "100"
+    2: "5551234"
+  didMap:                  # Inbound SIP DID (request URI user) -> radio ID that it rings
+    "1000": 1234
+  answerTimeout: 30        # Seconds to wait for a radio to answer an inbound call
+  voxThreshold: 500        # RMS level (16-bit PCM) at which phone audio is keyed toward the radio
+  voxHangTime: 600         # Milliseconds of phone silence before the radio-side transmission ends
