@@ -100,6 +100,7 @@ phonePatch:
   sourceRID: 9000001    # RID presented for SIP-originated transmissions
   maxCalls: 1           # max simultaneous phone patch calls
   inboundDID: "1000"   # SIP extension that rings for incoming PSTN calls
+  outboundNumber: "100" # number dialled when a radio keys up (empty = radio-originated calls disabled)
 ```
 
 Parse with `YamlDotNet`. Map each top-level section to a dedicated C# config class. Load at startup in `Program.cs` before building the host.
@@ -248,21 +249,25 @@ public class SipPeerSystem : fnecore.FneSystemBase
 }
 ```
 
-**P25 LDU IMBE frame extraction offsets** (verified from `dvmconsole/FneSystemBase.P25.cs`):
+**P25 LDU network framing** (verified against dvmhost `BaseNetwork` and fnecore `Constants.cs`):
 
-| Frame | LDU1 byte offset | LDU2 byte offset |
-|-------|-----------------|-----------------|
-| Voice 1  | 10  | 10  |
-| Voice 2  | 26  | 26  |
-| Voice 3  | 55  | 55  |
-| Voice 4  | 80  | 80  |
-| Voice 5  | 105 | 105 |
-| Voice 6  | 130 | 130 |
-| Voice 7  | 155 | 155 |
-| Voice 8  | 180 | 180 |
-| Voice 9  | 204 | 204 |
+An FNE P25 LDU message is a 24-byte header followed by nine DFSI voice records, **not** a raw 216-byte LDU. Total length is 193 bytes for LDU1 and 181 for LDU2; byte 180 is the frame type, written by `CreateP25MessageHdr`. Records are tagged 0x62–0x6A (LDU1) and 0x6B–0x73 (LDU2).
 
-Each `Buffer.BlockCopy(payload, offset, imbe, 0, 11)` extracts one 11-byte IMBE frame.
+| Record | Offset after header | Length | IMBE offset in record | Absolute IMBE offset | Extra fields (LDU1 / LDU2) |
+|--------|-----|----|----|-----|---|
+| Voice 1  | 0   | 22 | 10 | 34  | — |
+| Voice 2  | 22  | 14 | 1  | 47  | — |
+| Voice 3  | 36  | 17 | 5  | 65  | LCO, MFId, service options / MI[0..2] |
+| Voice 4  | 53  | 17 | 5  | 82  | dstId (3 bytes) / MI[3..5] |
+| Voice 5  | 70  | 17 | 5  | 99  | srcId (3 bytes) / MI[6..8] |
+| Voice 6  | 87  | 17 | 5  | 116 | RS / algId, keyId |
+| Voice 7  | 104 | 17 | 5  | 133 | RS / RS |
+| Voice 8  | 121 | 17 | 5  | 150 | RS / RS |
+| Voice 9  | 138 | 16 | 4  | 166 | LSD1, LSD2 |
+
+`payload[23]` = 24 + 154 = 178. The offsets 10, 26, 55, 80, 105, 130, 155, 180, 204 that appear in dvmconsole/dvmhost index a *reconstructed* 225-byte LDU buffer (records copied to 0, 25, 50, 75, …, 200). They are **not** offsets into the network message.
+
+A transmission uses one stream ID, alternates LDU1/LDU2, and ends with a TDU.
 
 Key points:
 - Use `fnecore.FnePeer` for the actual UDP connection and handshake — do not reimplement login/auth
@@ -410,70 +415,228 @@ Add `install` CMake/dotnet publish targets. Add to `tools/start-dvmsip.sh`.
 
 ---
 
-## Phase 3 — Trunked FDMA Phase 1 support
+## Phase 3 — Standards-based Telephone Interconnect (trunked FDMA)
 
-> **Prerequisite:** A PR to `DVMProject/dvmhost` must be merged before Phase 3 can be tested end-to-end.
+> **Prerequisite:** a PR to `DVMProject/dvmhost` that changes **both the host (`src/host`, `src/common`) and the FNE (`src/fne`)**. Both live in the dvmhost repository. Phase 3 cannot be tested end-to-end until that PR is merged. The current state described below was verified against dvmhost `r05a06_dev` (commit `536997ac`).
 
-### dvmhost PR — what to add
+### Background — what P25 actually defines
 
-The PR touches only the existing P25 trunking control infrastructure. No new files needed — all changes are additive to existing files.
+P25 Telephone Interconnect (TIA-102.BADA; signalling in TIA-102.AABC) is an **individual call between one subscriber unit and one telephone party**. It is not a group patch. Phases 1–2 implement a console-style *group* patch (`LC_GROUP` on a talkgroup), which sits outside the P25 interconnect service. Phase 3 implements the real service.
 
-**`src/host/p25/Control.cpp` / `Control.h`**
+**Signalling** (opcodes verified in fnecore `P25Defines.cs` and dvmhost `common/p25/P25Defines.h`; the earlier draft's 0x15/0x1A/0x1B were wrong):
 
-Add handling for three TSBK opcodes in the control channel receive path:
+| Opcode | Dir | Name | Purpose |
+|---|---|---|---|
+| 0x08 | ISP | `TELE_INT_DIAL_REQ` | Radio requests a call, **explicit dialing** — carries the dialed digits |
+| 0x09 | ISP | `TELE_INT_PSTN_REQ` | Radio requests a call, **implicit dialing** — carries an index into a preset number table held by the infrastructure |
+| 0x08 | OSP | `TELE_INT_DIAL_GRANT` | Voice channel grant for an interconnect call (includes a call timer) |
+| 0x0A | OSP | `TELE_INT_ANS_REQ` | Alerts (rings) a radio for an inbound phone call |
+| 0x0A | ISP | `TELE_INT_ANS_RSP` | Radio's answer: proceed / deny / wait |
+| 0x23 | ISP | `CAN_SRV_REQ` | Radio cancels / ends the call |
+| 0x27 / 0x33 | OSP | `DENY_RSP` / `QUE_RSP` | Request refused / queued |
 
-- `TSBK_IOSP_TEL_INT_VCH_REQ` (0x15) — radio-originated outgoing call request
-  - Extract dialed digits (BCD, up to 10 digits) and source RID from the TSBK payload
-  - Signal the FNE (or a registered telephone interconnect handler) with the dial request
-  - Allocate a voice channel and respond with TSBK 0x1A
+**Link control on the voice channel:**
+- `LC_TEL_INT_VCH_USER` (0x06) — carries a **single unit address** (the radio) plus the call timer.
+- `LC_TEL_INT_ANS_RQST` (0x07) — answer request for a unit that is already on a voice channel.
+- `LC_CALL_TERM` (0x0F) — call termination.
 
-- `TSBK_IOSP_TEL_INT_VCH_GRANT` (0x1A) — voice channel grant for telephone interconnect
-  - Sent by the site to the requesting radio
-  - Carries the assigned channel number and the source/destination RID
+> **Pitfall:** LCO 0x06 under `MFG_MOT` means *Motorola in-band GPS data*. Interconnect frames must use the standard MFId (0x00).
 
-- `TSBK_OSP_TEL_INT_ANS_RQST` (0x1B) — incoming call alert to radio
-  - Broadcast on the control channel when an inbound SIP call arrives
-  - Carries the destination RID of the radio being called
+> Verify exact TSBK field layouts (digit packing, call timer units, answer-response codes) against TIA-102.AABC when implementing. The table above fixes opcodes and directions only.
 
-**`src/common/p25/lc/TDULC.cpp` (or equivalent LC class directory)**
+**Call flows:**
+- **Radio → phone:**
+  1. The SU sends 0x08 (digits) or 0x09 (preset index).
+  2. The system authorises the SU and places the call. It may deny or queue the request.
+  3. The system grants a voice channel (0x08 OSP).
+  4. Ringback and call-progress tones reach the radio as voice audio.
+- **Phone → radio:**
+  1. The caller dials a DID.
+  2. The DID is mapped to a radio RID.
+  3. The system sends 0x0A OSP and the radio rings.
+  4. The radio answers with 0x0A ISP.
+  5. The system grants a voice channel.
+- **During the call:** the radio remains half-duplex PTT. The infrastructure sends phone audio to the radio only while the radio is not transmitting. The voice channel is held for the whole call (message trunking).
+- **Ending the call:** any of `CAN_SRV_REQ`, a phone-side hangup, or call timer expiry ends the call. The system then sends a TDULC carrying `LC_CALL_TERM` and releases the channel.
 
-Add `LC_TEL_INT_VCH_USER` link control word. This is the LC word embedded in LDU1/LDU2 headers when the voice channel carries a telephone interconnect call. Radios use this to display the correct call type indication.
+### Network addressing convention (decided)
 
-**`src/host/p25/packet/Voice.cpp`**
+`LC_TEL_INT_VCH_USER` carries **one** address, but the 24-byte network header has both `srcId` and `dstId`. On dvmhost dev, grants, voice-channel permits and FNE call tracking are all keyed on `dstId`. Interconnect calls therefore use this convention:
 
-When sourcing a voice stream on behalf of a telephone interconnect call (injected by DVMSIP via the FNE), emit `LC_TEL_INT_VCH_USER` in the LDU headers rather than the standard `LC_GROUP` or `LC_PRIVATE` type.
+| Leg | Header LCO | `srcId` | `dstId` |
+|---|---|---|---|
+| radio → phone (sourced by the site) | 0x06 | SU RID | **SU RID** |
+| phone → radio (sourced by DVMSIP) | 0x06 | gateway `sourceRID` | **SU RID** |
+| grant demand TDU from DVMSIP | 0x06 | gateway `sourceRID` | SU RID |
+
+- The call is always identified by the SU's RID.
+- The FNE determines direction from the **source peer**: is it a gateway peer or not. It does not use the IDs for this.
+- This replaces the earlier "dst = gateway ID" draft. With this rule the existing unit-to-unit code paths can mostly be reused.
+
+### dvmhost PR — file-level change list
+
+Verified against `r05a06_dev` (commit `536997ac`). Line numbers are approximate guides for that commit.
+
+#### 1. Common (`src/common`)
+
+**TSBK classes and factory** (`common/p25/lc/tsbk/`, `TSBKFactory.cpp` ~L167):
+- The standard decode switch has **no** interconnect cases. 0x08, 0x09 and **0x0A** all return `nullptr` ("unknown TSBK LCO").
+- Consequence: the `IOSP_TELE_INT_ANS` handler in `ControlSignaling.cpp` (~L313) is unreachable today.
+- **Done on `feature/p25-tele-int`:**
+  - `OSP_TELE_INT_VCH_GRANT` (0x08 OSP: channel, call timer in 100 ms units, SU address)
+  - `ISP_TELE_INT_PSTN_REQ` (0x09 ISP: preset index, SU address)
+  - `IOSP_TELE_INT_ANS` (0x0A: ISP answer response / OSP answer request with 10 BCD digits, where 0xF escapes and pads)
+  - the three classes registered in `TSBKFactory`, with layout tests in `tests/p25/TSBK_TeleInt_Tests.cpp`
+  - Field layouts were cross-checked against SDRTrunk's decoders.
+- **Explicit dialing (0x08 ISP) is an unconfirmed multi-block (UMBT) message, not a single TSBK.** dvmhost cannot receive it yet:
+  - `host/p25/packet/Data.cpp` (~L121) drops non-AMBT PDUs on dedicated control channels.
+  - `TSBKFactory::createAMBT` rejects non-AMBT formats.
+  - Supporting it is a separate step. Implicit dialing (0x09) works without it.
+- The Motorola remap list (~L118) already includes 0x0A. Whether Motorola SUs also send 0x08/0x09 with the MOT MFId needs a capture to confirm.
+
+**Grant request wire format** (`common/network/BaseNetwork.cpp` `writeGrantReq` ~L105):
+- Byte 19 carries the slot number plus `0x80` = U2U.
+- Add an interconnect flag (e.g. `0x40`), or replace the `unitToUnit` bool with a service-type value.
+- Update the parser in `fne/network/packet/GrantRequest.cpp` (~L58).
+
+**Gateway peer flag** (`common/lookups/PeerListLookup.h` ~L174): add a `telephoneInterconnect` property next to `canIssueInhibit`, with parsing in the peer list file loader.
+
+**Optional:** a per-RID interconnect permission in the RID ACL.
+
+#### 2. Host (`src/host/p25`)
+
+**`ControlSignaling::process`** (~L216):
+- **New 0x08 / 0x09 ISP handling:** `IS_SUPPORT_CONTROL_CHECK`, `VALID_SRCID`, `VERIFY_SRCID_REG`. ACK or queue the SU, then forward the TSBK to the network. Do **not** grant yet; the grant follows the gateway's grant demand.
+- **0x0A ISP:** replace the `DENY_SYS_UNSUPPORTED_SVC` at ~L313–322 with forwarding to the network. Mirror the U2U deny/queue handling for `ANS_DENY` / `ANS_WAIT` (~L293–310).
+- **`ISP_CAN_SRV_REQ`** (~L468): if the SU holds an interconnect grant, release it and forward the cancel.
+
+**`ControlSignaling::processNetwork`** (~L838):
+- 0x0A OSP from a gateway: transmit to air only if the target SU is registered at this site.
+- Interconnect ISPs (0x08, 0x09, 0x0A ISP) arriving from the network: `return true`, so they are never written to air.
+
+**`ControlSignaling::writeRF_TSDU_Grant`** (~L2150) takes `bool grp`. Change it to a three-way grant type (group / U2U / interconnect). The interconnect path:
+- keys the grant on the SU RID;
+- skips talkgroup checks;
+- requires `isUnitReg(SU)` (as U2U does, ~L2255);
+- reuses the U2U `RPC_PERMIT_P25_TG` voice-channel permit (~L2448–2489);
+- transmits the 0x08 OSP grant instead of `IOSP_UU_VCH` (~L2523);
+- uses the interconnect service opcode in its denials.
+
+**Network grant demand** (`Control.cpp` ~L1642–1700):
+- `validateTGId(dstId)` at ~L1670 rejects a RID whenever the TG ACL is enforced.
+- When the header LCO is 0x06, validate `dstId` as a RID and grant as interconnect.
+- The same TG check exists in the explicit-TDU release path (~L1716).
+
+**Voice channel, RF-sourced** (`packet/Voice.cpp` ~L250–320):
+- `LC::decodeLC` for 0x06 (`common/p25/lc/LC.cpp` ~L1112) sets only `srcId` and `callTimer`, so `dstId == 0`.
+- The SU is then rejected twice: by the target-RID check (~L305) and by the `m_permittedDstId` check (~L162, ~L619).
+- **Done in step 5**, in the common LC classes so every decode site picks it up:
+  - Decoding 0x06 sets `dstId` to the single address (the SU) and `m_group = false`.
+  - Encoding 0x06 puts `dstId` (falling back to `srcId`) in the address field.
+  - Two pre-existing encoder bugs were fixed:
+    - `LC::encodeLC` was missing the reserved octet, so service options landed in octet 3.
+    - The `LC_TEL_INT_VCH_USER` TDULC wrote the unit-to-unit layout.
+  - Layouts were verified against SDRTrunk. Test: `TDULC_Tests` "TelInt_Encode_Decode_Layout".
+- **Voice channel permit:** the control channel's permit RPC carries `"telInt": true`. The voice channel then keeps that permit through TG hang expiry, so pauses between bursts don't drop the call. It is cleared only by the control channel's unpermit.
+- **RF header (HDU):** an interconnect HDU with no talkgroup is attributed to the unit permitted on the channel.
+
+**Voice channel, network-sourced** (`Voice.cpp` `writeNet_LDU1` ~L1795–1850):
+- Non-group handling already validates `dstId` as a RID (~L1885).
+- `LC::encodeLC` for 0x06 (~L1236) puts **`m_srcId`** in the single address field, and the DFSI network records carry no call timer. As written, the air LC would show the gateway's `sourceRID` with a call timer of 0.
+- Fix: put `dstId` (the SU) in the air LC address and set the call timer from the grant.
+- Force the standard MFId: under `MFG_MOT`, 0x06 means in-band GPS (`P25Defines.h` ~L752).
+
+**Later:**
+- embed `LC_TEL_INT_ANS_RQST` for units already on a voice channel;
+- send TDULC `LC_CALL_TERM` on cancel, hangup, or call-timer expiry.
+
+#### 3. FNE (`src/fne/network/callhandler/TagP25Data.cpp`)
+
+- **`validate()`:** treat LCO 0x06 like `PRIVATE`, checking the RID ACL on `dstId` instead of talkgroup rules (today it is dropped with ICC `REJECT_TRAFFIC`).
+- **`isPeerPermitted()`:** permit 0x06 traffic only to gateway peers when the source is a site, and only to `findPeerUnitReg(dstId)` when the source is a gateway.
+- **Call start and the repeat loop** (~L580, ~L656–760): extend the `lco == LCO::PRIVATE` branches to cover 0x06 with the direction rule above.
+  - Apply the restriction **always**, not only when `m_restrictPVCallToRegOnly` is set; otherwise phone audio reaches every peer.
+- **TSDU routing:** today `tsbk` is `nullptr` for interconnect opcodes, so they pass `validate()` and are **repeated to every peer**, dialed digits included. Once the factory decodes them:
+  - send radio-originated interconnect ISPs (0x08, 0x09, 0x0A) only to gateway peers;
+  - send a gateway's 0x0A OSP only to the peer where the target SU is registered.
+- **`processGrantReq()`** (~L846): add an interconnect branch. The current code rejects any `dstId` that is not a valid, active talkgroup.
+- Phase 2 TDMA (`TagP25P2Data.cpp`) already passes `TEL_INT_VCH_USER` through for late entry. Interconnect over TDMA is out of scope; leave it unchanged.
+
+#### Implementation order
+
+1. TSBK classes and factory.
+2. Control-channel request handling and forwarding.
+3. FNE routing and gateway peer flag.
+4. Grants.
+5. Voice-channel address and call timer fixes.
+6. DVMSIP (tasks below).
+
+Steps 1–3 can be tested with synthetic gateway traffic before any RF testing.
 
 **Testing the dvmhost PR:**
-
-- Unit test: craft a raw TSBK 0x15 frame and verify the handler extracts digits and RID correctly
-- Integration test: use a P25 radio to dial a number; observe TSBK 0x1A grant on the control channel in a P25 decoder (e.g. OP25 or Unitrunker)
+- Unit tests: craft raw 0x08, 0x09 and 0x0A TSBKs and verify decode/encode round-trips (digits, preset index, answer code).
+- FNE: confirm an LCO 0x06 stream from the gateway reaches only the registering site, and that a 0x08 ISP reaches only the gateway peer.
+- RF: dial from a P25 radio and observe the 0x08 OSP grant and LCO 0x06 on the voice channel in a P25 decoder (e.g. OP25).
 
 ### DVMSIP Phase 3 tasks
 
-### Task 12 — Trunked call state machine
+#### Task 12 — Per-unit interconnect state machine
 
-Extend `CallStateMachine` with trunked states:
+Calls are keyed by **RID**, not talkgroup:
 
 ```
 IDLE → DIALING → RINGING → CONNECTED → RELEASING → IDLE
 ```
 
-- **DIALING** (radio → SIP): TSBK 0x15 received via FNE → DVMSIP places SIP INVITE → wait for SIP response
-- **RINGING**: SIP 180 Ringing received → wait for radio to answer (TSBK 0x1A grant acknowledged by radio)
-- **CONNECTED**: SIP 200 OK + radio on channel → full-duplex bridge active
-- **RELEASING**: either side hangs up → send SIP BYE + TSBK call termination → drain audio → IDLE
+- **Radio → phone:**
+  - **DIALING:** 0x08 or 0x09 ISP arrives via the FNE. Resolve the number and send a SIP INVITE.
+  - **RINGING:** SIP 18x arrives. Ringback audio is passed to the radio once a channel is granted.
+  - **CONNECTED:** SIP 200 OK arrives. Request the grant and bridge audio.
+- **Phone → radio:**
+  - **DIALING:** SIP INVITE arrives. Map the DID to a RID (new config map) and send 0x0A OSP via the FNE. Answer the INVITE with SIP 180.
+  - **RINGING:** wait for 0x0A ISP:
+    - proceed → SIP 200 and grant, then CONNECTED
+    - deny → SIP 486 (Busy Here)
+    - wait → stay in RINGING
+  - No answer before a configurable timeout → SIP 408 (Request Timeout) or 480 (Temporarily Unavailable).
+- **RELEASING:** triggered by SIP BYE, `CAN_SRV_REQ`, or call timer expiry. Send `LC_CALL_TERM` and a SIP BYE, drain audio, return to IDLE.
 
-- **DIALING** (SIP → radio): SIP INVITE received → DVMSIP sends TSBK 0x1B (Answer Request) via FNE → wait for radio acknowledgement
-- **RINGING**: waiting for radio to key up
-- **CONNECTED**: radio keys up on granted channel → full-duplex bridge
+#### Task 13 — Dialing
 
-### Task 13 — Digit relay from radio to SIP
+- **Explicit dialing:** convert the digits from 0x08 ISP into the SIP request URI, applying a configurable dial plan (prefixes, allowed patterns).
+- **Implicit dialing:** look up the 0x09 preset index in a new `phonePatch.presetNumbers` config table.
+- Deny unknown indices and disallowed numbers back to the SU.
 
-TSBK 0x15 carries the dialed digits. Extract BCD digits in the TSBK handler and pass them to `SipService.PlaceCallAsync(digits)`. Map the configured dial plan if needed (e.g. prefix a 9 for outside lines).
+#### Task 14 — Caller ID
 
-### Task 14 — Caller ID
+Log the SIP `From` number. Include it in 0x0A OSP only if the TIA-102.AABC field layout provides for it; otherwise log only.
 
-For SIP → radio calls, the SIP `From` header contains the caller's number. Relay it via P25 supplementary data if dvmhost adds support. For Phase 3, log it and include it in the TSBK 0x1B payload where the standard permits.
+#### Task 15 — Half-duplex turnaround
+
+Required for standards behaviour, and also recommended for the Phase 1–2 conventional patch:
+- Gate SIP → radio audio with voice activity detection (VOX) on the PCM stream.
+- Transmit only while the phone party is speaking **and** no radio is keyed.
+- The FNE enforces this: both legs share `dstId` (the SU RID), so its call-collision logic rejects a gateway stream that starts while the radio's stream is still active. Wait for the radio's terminator before keying.
+- End each burst with a TDU.
+- Radio → SIP audio flows whenever the radio is keyed.
+
+#### Task 16 — Wire format
+
+Follow the network addressing convention above:
+- **Receive trunking messages:** `P25DataReceived` must accept TSDUs (it currently drops everything except LDUs) and parse 0x08 / 0x09 / 0x0A from the raw TSBK. fnecore has no classes for these.
+- **Ring a radio:** send 0x0A OSP with `FneSystemBase.SendP25TSBK`.
+- **Request a channel:** send a TDU with grant demand set (control byte `0x80`), header LCO 0x06, `srcId` = `sourceRID`, `dstId` = SU RID.
+- **Keep the grant alive:** the control channel holds interconnect grants for the whole call (message trunking) and does not release them on per-burst TDUs. Re-send the grant-demand TDU every few seconds during the call; the control channel's grant timer is 15 s (`GRANT_TIMER_TIMEOUT`).
+- **Deny a request:** send the grant-demand TDU with grant denial also set (control byte `0xC0`). The control channel sends the SU a deny (`DENY_TGT_UNIT_REFUSED`, service 0x08). Use this when the SIP call fails or the number is not allowed.
+- **End the call:** send a TDULC carrying `LC_CALL_TERM` with header LCO 0x06. That TDULC is what releases the grant on the control channel.
+- **Limits of the current host implementation:**
+  - Explicit-channel (multi-block grant) sites refuse interconnect grants.
+  - The grant's call timer is 0 (no timer).
+- **Voice streams:**
+  - LCO 0x06 with the standard MFId; `srcId` = `sourceRID`, `dstId` = SU RID
+  - one stream ID per burst
+  - alternating LDU1/LDU2
+  - a terminating TDU per burst, and a TDULC `LC_CALL_TERM` when the call ends
 
 ---
 
@@ -518,9 +681,11 @@ sudo systemctl enable --now dvmsip
 | dvmvocoder (IMBE library) | `extern/dvmvocoder/vocoder/` — check headers for exact P/Invoke signatures |
 | dvmconsole (vocoder P/Invoke reference) | `github.com/DVMProject/dvmconsole` — canonical example of dvmvocoder + fnecore wired together in C# |
 | SIPSorcery docs | `github.com/sipsorcery-org/sipsorcery` |
-| TIA-102.AABC | P25 TSBK opcode definitions — opcodes 0x15, 0x1A, 0x1B |
-| TIA-102.BADA | P25 Telephone Interconnect Interface overview |
-| dvmhost P25 trunking | `src/host/p25/Control.cpp` in dvmhost — existing TSBK handler pattern to follow for the PR |
+| TIA-102.AABC | P25 TSBK definitions — telephone interconnect opcodes 0x08 (dial req / grant), 0x09 (PSTN req), 0x0A (answer req / rsp) |
+| TIA-102.BADA | P25 Telephone Interconnect requirements and definitions |
+| dvmhost control channel | `src/host/p25/packet/ControlSignaling.cpp` — TSBK handlers; the U2U (`IOSP_UU_VCH` / `IOSP_UU_ANS`) flow is the closest pattern to follow |
+| dvmhost TSBK classes | `src/common/p25/lc/tsbk/` + `TSBKFactory.cpp` |
+| dvmfne P25 routing | `src/fne/network/callhandler/TagP25Data.cpp` — `isPeerPermitted()`, `validate()`, private-call routing, `processGrantReq()` |
 
 ---
 
@@ -529,9 +694,10 @@ sudo systemctl enable --now dvmsip
 - **Vocoder P/Invoke signatures are verified.** Library name is `libvocoder` (not `dvmvocoder`). Exact C interop exports are `MBEDecoder_Create/Decode/Delete` and `MBEEncoder_Create/Encode/Delete` with `CallingConvention.Cdecl`. Mode constant for P25 IMBE = `1` (`DECODE_88BIT_IMBE` / `ENCODE_88BIT_IMBE`). IMBE frame = 11 bytes, 160 PCM samples per frame, 20 ms.
 - **No vocoder libraryPath config.** `libvocoder.dll`/`.so`/`.dylib` is placed next to the executable. Standard OS library search applies. Do not add a `vocoder` config section.
 - **fnecore base class is `fnecore.FneSystemBase`.** `FnePeer` is created first and passed to the base constructor. Wire `peer.Logger` to Serilog. `PeerDisconnected` is an `Action<uint>` delegate on `FnePeer`; `PeerConnected` is an abstract event override on `FneSystemBase`.
-- **P25 LDU IMBE offsets are verified.** Frames are at byte offsets 10, 26, 55, 80, 105, 130, 155, 180, 204 in the 216-byte LDU payload.
-- **DVM config parity.** Config YAML structure and field names mirror dvmhost/dvmfne style (snake_case, same section names). The `network.local` field is kept for parity but FnePeer does not expose local port binding.
+- **P25 LDU network framing is DFSI, not a raw LDU.** FNE messages are a 24-byte header + nine DFSI voice records (see the Task 3 table). Absolute IMBE offsets in the network message are 34, 47, 65, 82, 99, 116, 133, 150, 166. The often-quoted 10, 26, 55, … 204 index a reconstructed 225-byte buffer, not the message.
+- **DVM config parity.** Config YAML structure and field names mirror dvmhost/dvmfne style (camelCase keys, same section names). The `network.local` field is kept for parity but FnePeer does not expose local port binding.
 - **Cross-platform target.** .NET 8, targeting win-x64 / linux-x64 / osx-arm64. Native `libvocoder` must be compiled per-platform. No Windows-only or Linux-only APIs in managed code.
-- **Conventional mode first.** Phases 1 and 2 require no changes outside this repository. Phase 3 is out of scope until the dvmhost PR is merged.
-- **No TDMA/AMBE+2.** DVMProject supports P25 conventional and FDMA Phase 1 only.
+- **Conventional mode first.** Phases 1 and 2 require no code changes outside this repository. They do need FNE *configuration*: the talkgroup present and active in talkgroup rules, DVMSIP's peer ID permitted, and `sourceRID` enabled if the FNE rejects unknown RIDs.
+- **Phase 3 needs host *and* FNE changes** (both in the dvmhost repo). Out of scope here until that PR is merged.
+- **FDMA only for DVMSIP.** dvmhost `r05a06_dev` adds P25 Phase 2 TDMA (`host/p25/phase2`, FNE `TagP25P2Data`), but DVMSIP bridges Phase 1 FDMA LDUs / IMBE only. Interconnect over TDMA (AMBE+2) is out of scope.
 - **License:** fnecore is AGPLv3. dvmsip.csproj must declare `<PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>` and include a LICENSE file.
